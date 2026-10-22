@@ -1,0 +1,431 @@
+/* ===== 容器布局 ===== */
+.md-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  flex: 1;
+  min-height: 220px;
+  gap: 16px;
+  color: var(--faint);
+}
+.md-empty[hidden] { display: none; }
+
+.md-empty-icon {
+  font-size: 48px;
+  opacity: 0.3;
+}
+
+.md-empty-text {
+  font-size: 13px;
+}
+
+#mdOpenFileBtn, #mdOpenFileBtn2 {
+  padding: 8px 16px;
+}
+
+/* 注意：id 是 markdownContainer，早期这里误写成 #mdContainer，整块 flex 布局从未生效，
+   导致内容把面板撑到几千 px 高、滚动落到外层 panel-view 上（工具栏/目录会被滚走） */
+#markdownContainer {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+/* display:flex 会盖过 [hidden] 的 UA display:none */
+#markdownContainer[hidden] { display: none; }
+
+/* ===== 工具栏 ===== */
+.md-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  gap: 12px;
+  flex-wrap: wrap;
+  flex-shrink: 0; /* 固定在顶部，不参与内容区滚动 */
+}
+
+.md-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--faint);
+  flex: 1;
+  min-width: 200px;
+}
+
+.md-path-label {
+  font-weight: 500;
+}
+
+.md-file-name {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 300px;
+}
+
+.md-file-info {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.md-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.md-actions .btn {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+/* ===== 主区域布局 ===== */
+.md-main {
+  display: flex;
+  flex: 1;
+  min-height: 0; /* 允许被压缩到父容器高度，子面板才能各自滚动 */
+  gap: 0;
+  overflow: hidden;
+}
+
+/* ===== 目录树面板 ===== */
+.md-toc-panel {
+  width: 220px;
+  flex-shrink: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.md-toc-head {
+  flex-shrink: 0;
+  padding: 10px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  background: var(--panel);
+}
+
+.md-toc-tree {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain; /* 目录滚到底不要把外层一起带着滚 */
+  padding: 8px 0;
+}
+
+.md-toc-tree::-webkit-scrollbar {
+  width: 6px;
+}
+
+.md-toc-tree::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.md-toc-tree::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+.md-toc-tree::-webkit-scrollbar-thumb:hover {
+  background: var(--border-soft);
+}
+
+/* 目录项是原生 <button>：必须显式清掉 UA 默认的 buttonface 底色 / outset 边框 /
+   Arial 字体 / 居中对齐，否则在深色面板上会渲染成一排浅灰凸起方块且文字不可读 */
+.md-toc-item {
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  background: none;
+  border: 0;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: left;
+  padding: 5px 10px 5px 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.md-toc-item:hover {
+  background: var(--accent-ultra-soft, rgba(217, 119, 87, 0.08));
+  color: var(--text);
+}
+
+.md-toc-item:focus-visible {
+  outline: none;
+  background: var(--accent-ultra-soft, rgba(217, 119, 87, 0.08));
+  border-left-color: var(--accent-hi);
+  color: var(--text);
+}
+
+.md-toc-item.active {
+  background: var(--accent-soft, rgba(217, 119, 87, 0.14));
+  border-left-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* h1 作为文档主标题，视觉上比下级更重（:not(.active) 同理，避免盖掉选中态配色） */
+.md-toc-item[data-level='1']:not(.active) {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 缩进：每级 10px。面板只有 220px 宽，原来的 12px/级到 h6 会吃掉三分之一宽度，
+   长标题几乎全被省略号吞掉，所以收窄并在 h5/h6 处封顶 */
+.md-toc-item[data-level="1"] { padding-left: 12px; }
+.md-toc-item[data-level="2"] { padding-left: 22px; }
+.md-toc-item[data-level="3"] { padding-left: 32px; }
+.md-toc-item[data-level="4"] { padding-left: 42px; }
+.md-toc-item[data-level="5"] { padding-left: 50px; }
+.md-toc-item[data-level="6"] { padding-left: 56px; }
+/* 深层标题弱化。用 :not(.active) 把选中态摘出去，否则这条会盖掉上面的 .active 配色 */
+.md-toc-item[data-level="4"]:not(.active),
+.md-toc-item[data-level="5"]:not(.active),
+.md-toc-item[data-level="6"]:not(.active) { font-size: 11.5px; color: var(--faint); }
+.md-toc-item[data-level="4"]:not(.active):hover,
+.md-toc-item[data-level="5"]:not(.active):hover,
+.md-toc-item[data-level="6"]:not(.active):hover { color: var(--text); }
+
+/* ===== 内容面板 ===== */
+.md-content-panel {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* ===== 搜索框 ===== */
+.md-search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  flex-shrink: 0; /* 常驻内容区顶部 */
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+#mdSearchInput {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-family: inherit;
+  transition: border-color 0.15s;
+}
+
+#mdSearchInput::placeholder {
+  color: var(--faint);
+}
+
+#mdSearchInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.md-search-count {
+  font-size: 11px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+#mdSearchClearBtn {
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+/* ===== 内容区 ===== */
+/* 全工具唯一的纵向滚动容器 */
+#mdContent {
+  flex: 1;
+  min-height: 0;
+  /* 让自己成为 offsetParent：目录滚动联动要拿标题相对内容区的偏移，
+     否则 offsetTop 会算到 .app（它是 position:relative）上去 */
+  position: relative;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scroll-behavior: smooth;
+  /* 目录跳转时标题不要贴死在顶边，留出一点呼吸位 */
+  scroll-padding-top: 12px;
+  padding: 16px 24px 40px;
+  line-height: 1.6;
+  color: var(--text);
+}
+
+#mdContent::-webkit-scrollbar {
+  width: 8px;
+}
+
+#mdContent::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#mdContent::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+#mdContent::-webkit-scrollbar-thumb:hover {
+  background: var(--border-soft);
+}
+
+/* ===== Markdown 渲染样式 ===== */
+#mdContent h1,
+#mdContent h2,
+#mdContent h3,
+#mdContent h4,
+#mdContent h5,
+#mdContent h6 {
+  margin: 18px 0 8px 0;
+  font-weight: 600;
+  color: var(--text);
+}
+
+#mdContent h1 { font-size: 24px; }
+#mdContent h2 { font-size: 20px; }
+#mdContent h3 { font-size: 18px; }
+#mdContent h4 { font-size: 16px; }
+#mdContent h5 { font-size: 14px; }
+#mdContent h6 { font-size: 13px; }
+
+#mdContent p {
+  margin: 8px 0;
+}
+
+#mdContent ul,
+#mdContent ol {
+  margin: 8px 0;
+  padding-left: 24px;
+}
+
+#mdContent li {
+  margin: 4px 0;
+}
+
+#mdContent blockquote {
+  margin: 8px 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  background: var(--accent-extra-soft, rgba(217, 119, 87, 0.05));
+  color: var(--text);
+}
+
+#mdContent code {
+  background: var(--panel-2);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent-hi);
+}
+
+#mdContent pre {
+  background: var(--panel-2);
+  padding: 12px;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 8px 0;
+  border: 1px solid var(--border-soft);
+}
+
+#mdContent pre code {
+  background: none;
+  padding: 0;
+  color: var(--accent-hi);
+  font-size: 12px;
+}
+
+#mdContent mark {
+  background: var(--amber);
+  color: var(--bg);
+  padding: 2px 4px;
+  border-radius: 2px;
+}
+
+#mdContent table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+  font-size: 13px;
+}
+
+#mdContent th,
+#mdContent td {
+  padding: 8px 12px;
+  border: 1px solid var(--border-soft);
+  text-align: left;
+}
+
+#mdContent th {
+  background: var(--panel);
+  font-weight: 600;
+}
+
+#mdContent a {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+#mdContent a:hover {
+  text-decoration: underline;
+}
+
+/* ===== 工具态侧栏底栏：仅「打开…」按钮（打开历史区已移除） ===== */
+.tools-footer {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 8px;
+  border-top: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.14);
+}
+
+.tools-footer[hidden] { display: none; }
+
+/* 撑满一行（原 .block 类在 app.css 里并不存在） */
+.tools-footer .btn {
+  width: 100%;
+  flex-shrink: 0;
+}
+
+/* ===== 响应式：小屏幕隐藏目录树 ===== */
+@media (max-width: 900px) {
+  .md-toc-panel {
+    display: none;
+  }
+
+  .md-main {
+    flex-direction: column;
+  }
+}

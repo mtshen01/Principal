@@ -1,0 +1,4218 @@
+// chat.js —— 聊天体（2026-07-24 壳/体反转切分自 app.js）：状态区 / UI 偏好 / 对话历史 / 消息模型与渲染 / 打字机 / 额度 / 发送与流 / 待续跑轮询
+import { toast, confirmDialog, promptDialog } from './ui.js';
+import { $, debounce, renderMarkdown, lsSet, isMarkdownPath } from './util.js';
+import { decorateUltracode, canEnableUltracode } from './ultracode.logic.js';
+import { decorateFigmaRestore, hasFigmaUrl } from './figma-restore.logic.js';
+import {
+  getPromptText, clearPrompt, handleDrop, insertDroppedPaths, getPromptAttachments,
+  stashPrompt, restorePrompt, bindComposerDraft,
+} from './composer.js';
+import {
+  loadConvs, mutateConvs, onConvsChange, flushConvs,
+  convPushMessage, convSetMessage, convSetSession, convSetMsgFields,
+  moveMessageToEnd, removeMessageAt, bubbleReset, bubblePush, bubbleGet,
+  convSetTitle, convSetMeta, convDelete, convSetDraft, convSetContextUsage,
+} from './conv-store.js';
+import { bindDirPopover, closeDirModal } from './dir-popover.js';
+import { bindGitSelector, reinitializeGitSelector } from './git-selector.js';
+import { bindOptimizeCwd } from './optimize-view.js';
+import { bindOptimizeBadgeCwd, probeOptimizeBadge, refreshOptimizeBadge } from './optimize-badge.js';
+import { ContextProgress } from './context-progress.js';
+import { groupConvsByDay } from './conv-groups.logic.js';
+import { contextUsageView } from './context-usage.logic.js';
+import { createQueueStrip } from './queue-strip.js';
+import { mergeQueue } from './queue-strip.logic.js';
+import { AnimeAnimations } from './anim.js';
+import { registerDropZone } from './drag-bus.js';
+import { setIconText, PIN_ICON_SVG, REFRESH_ICON_SVG, WAITING_ICON_SVG, FIGMA_RESTORE_ICON_SVG } from './icons.js';
+import { VENDOR_PRESETS } from './vendor-presets.js';
+import { builtinToolsFor } from './tool-list.logic.js';
+import {
+  CLAUDE_EFFORTS, EFFORT_OFF, ULTRACODE,
+  effortLabel, effortDesc, effortTickLabel, effortOptions, pickEffort, applyEffortChoice, rehomeCustomCred,
+} from './effort.logic.js';
+bindDirPopover({ getCwd: () => cwd, selectDir }); // 惰性读 cwd 无 TDZ；selectDir 已提升
+bindGitSelector({ getCwd: () => cwd }); // 仅注入读取器；首探在 initChat（后端就绪闸门之后）发起
+bindOptimizeCwd({ getCwd: () => cwd }); // 项目优化恒作用于当前项目，不再自带目录选择
+bindOptimizeBadgeCwd({ getCwd: () => cwd }); // 同上：惰性读，此刻 cwd 尚未初始化
+// 挂全局给 app.js 的「展开工具列表」用（项目已有 _setSidebarToolsMode 等同类挂载）
+window._refreshOptimizeBadge = refreshOptimizeBadge;
+// Tauri 桌面版：文件/目录拖入直接插本地路径 chip，无需上传副本。
+// 走拖拽总线而非旧的单槽位 bindTauriDrop——Markdown 查看器也要注册，单槽位会互相覆盖。
+// Web 模式下总线永不触发（tauri://drag-* 不存在），HTML5 + 上传副本路线继续生效。
+{
+  const promptZoneEl = document.querySelector('#prompt');
+  if (promptZoneEl) {
+    registerDropZone({
+      el: promptZoneEl,
+      onDragOver: () => promptZoneEl.classList.add('dragover'),
+      onDragLeave: () => promptZoneEl.classList.remove('dragover'),
+      onDrop: (paths, pt) => {
+        promptZoneEl.classList.remove('dragover');
+        // 光标移到落点，附件插在拖放位置（与旧 HTML5 版行为保持一致）
+        const r = document.caretRangeFromPoint ? document.caretRangeFromPoint(pt.x, pt.y) : null;
+        if (r && promptZoneEl.contains(r.startContainer)) {
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(r);
+        }
+        // 这是唯一一处 fire-and-forget 调用，兜在这里而不是塞进 insertDroppedPaths 内部：
+        // 后者保留 rejection 语义，将来有 await 的调用方才拿得到失败原因
+        insertDroppedPaths(paths).catch((err) => console.error('[Drop] 插入路径 chip 失败:', err));
+      },
+    });
+  }
+}
+// 视图桥：壳注入「回聊天视图」跳转，体内 5 处原直调改经 _goChat()
+let _goChat = () => {};
+// 视图桥：聊天视图是否当前激活（供 refreshAskChip 判定，避免反向依赖 app.js 的 activeView）
+let _isChatViewActive = () => true;
+export function bindChatNav(goChat, isActiveFn) {
+  _goChat = goChat;
+  if (isActiveFn) _isChatViewActive = isActiveFn;
+}
+// 视图桥：需求会话钩子（Task 10）——切到/离开需求 conv 时通知 req-chat.js 挂/卸载横幅右栏
+let _reqConvHook = null;
+export function bindReqConvHook(fn) { _reqConvHook = fn; }
+
+// 视图桥：Markdown 打开逻辑（切换视图 + 打开文件）
+let _openMarkdown = null;
+export function bindMarkdownNav(fn) {
+  _openMarkdown = fn;
+}
+/**
+ * 跳 Markdown 查看器。聊天里的路径 chip 与需求右栏的 API 文档共用这一条桥，
+ * 免得两处各自拿 window 全局去够 markdownTool，行为再慢慢跑偏。
+ * @returns {boolean} 是否已接管；非 md 或视图桥尚未注入时返回 false，调用方走各自降级
+ */
+export function openMarkdownFile(path) {
+  if (!isMarkdownPath(path) || !_openMarkdown) return false;
+  _openMarkdown(path);
+  return true;
+}
+
+      // ============================================================
+      // 页面逻辑
+      // ============================================================
+
+      const messagesEl = $('#messages');
+      const emptyEl = $('#empty');
+      const promptEl = $('#prompt');
+      const sendBtn = $('#sendBtn');
+      const stopBtn = $('#stopBtn');
+      // 排队卡片条（queue-first）：状态与出网在下方「排队卡片」区维护，这里只挂交互回调
+      const queueStrip = createQueueStrip({
+        root: $('#queueStrip'),
+        onSteer: (id) => steerQueuedMsg(id),
+        onWithdraw: (id) => withdrawQueuedMsg(id),
+      });
+
+      // 分页加载控制
+      let _msgPagingOffset = 0;  // 从末尾已渲染的消息条数
+      let _msgPagingTotal = 0;   // 当前会话消息总数（用于判断是否还有更多）
+      let _msgPagingMsgs = null; // 当前已拉取的完整消息数组缓存（避免重复拉取）
+
+      // 创建"加载更早消息"按钮容器，插入在 messagesEl 之前
+      const _loadMoreMsgsEl = document.createElement('div');
+      _loadMoreMsgsEl.id = 'loadMoreMsgsEl';
+      _loadMoreMsgsEl.className = 'load-more-msgs-wrap';
+      _loadMoreMsgsEl.style.display = 'none';
+      messagesEl.parentNode.insertBefore(_loadMoreMsgsEl, messagesEl);
+
+      // ---- DOM 上限控制（防长会话卡顿）----
+      const MAX_DOM_MESSAGES = 300; // 单会话保留最多 300 条「完整渲染」的气泡，更早的折叠为占位
+
+      /**
+       * 折叠一条早期气泡：清空渲染内容、保留节点本身。
+       * 保留节点是刚性要求 —— 全模块靠「存储索引 = DOM 索引」定位气泡，删节点会让索引整体错位。
+       * 清空内容才是真正省内存的那一步（markdown 渲染树往往比原文大一个数量级）。
+       */
+      function collapseBubble(el) {
+        if (!el || el.classList.contains('collapsed')) return;
+        const text = el.textContent || '';
+        el.classList.add('collapsed');
+        el.replaceChildren(); // 丢掉整棵渲染子树
+        el.textContent = text.slice(0, 80) + (text.length > 80 ? '…' : '');
+        el.title = '较早的消息，已折叠以节省内存';
+      }
+
+      // ---- 状态 ----
+      // 一窗一项目：项目上下文来源——桌面版经 Rust initialization_script 注入全局
+      // （打包版 custom protocol 下 URL query 会致新窗白屏）；web 版走 URL ?cwd=&conv=。前者优先。
+      const _qs = new URLSearchParams(location.search);
+      const _urlCwd = typeof window.__PROJECT_CWD__ === 'string' ? window.__PROJECT_CWD__ : _qs.get('cwd');
+      const _urlConv = typeof window.__PROJECT_CONV__ === 'string' ? window.__PROJECT_CONV__ : _qs.get('conv');
+      let cwd = _urlCwd != null ? _urlCwd : (localStorage.getItem('claude_cwd') || ''); // 空=服务目录
+      let currentSession = null;
+      const runningJobs = {}; // convId -> { es, asstIndex, text }：并行运行中的会话
+      // convId -> true：该会话有 follow-up 消息在服务端排队（openai 运行中追加的消息）。
+      // 用途：① run 终结（done）后触发提前轮询，尽快接上排空起的新 run；② 期间用户再发消息时
+      // 先尝试发现新 run 再决定走插话/新起。由 /send 的 mode:'follow_up' 响应与飞书注入项标记，
+      // 在 refreshPending 接上新 run 时清除。
+      const convFollowUpPending = {};
+      // queue-first（2026-10-16）：运行中发送默认排队，卡片显示在输入框上方（#queueStrip）。
+      // 服务端 /api/run/queue 是唯一真相；convQueues 是渲染镜像，并持久化到 conv.meta.queue
+      // 兜「关页期间被投递」——重开页面时本地项不在服务端清单 → 视作已投递、上屏。
+      const convQueues = {}; // convId -> [{id,text,at}]
+      const queueRunIds = {}; // convId -> /api/run/queue 返回的当前运行 runId（卡片动作的目标）
+      const queuePending = {}; // convId -> 正在出网的卡片 id（按钮防抖）
+      const queueSyncInflight = {}; // convId -> true：对账请求在途（合并突发事件，dirty 补跑一次）
+      const queueSyncDirty = {}; // convId -> true：在途期间又来了对账请求
+      const drainedFollowUps = {}; // convId -> /api/run/pending 的 followUps 记录（后台会话打开时补接流）
+      // 模型 / effort / 权限模式
+      let chatModel = localStorage.getItem('claude_model') || 'auto';
+      let chatEffort = localStorage.getItem('claude_effort') || 'medium';
+      let chatMode = localStorage.getItem('claude_mode') || 'default'; // default|acceptEdits|plan|bypassPermissions
+      let chatProvider = localStorage.getItem('claude_provider') || 'claude-agent';
+      let chatDisabledTools = JSON.parse(localStorage.getItem('claude_disabled_tools') || '[]');
+      let chatCustomModel = localStorage.getItem('claude_custom_model') || '';
+      let chatCustomLabel = localStorage.getItem('claude_custom_label') || '';
+      // 选中的自定义凭证 id。**必须随请求带上**：服务端此前只收 model，凭证靠
+      // pickActive 取「第一个可用的 openai-compat」，于是多厂商共存时必然串台——
+      // 点智谱发出 model=glm-4，却配上 DeepSeek 的 apiKey/baseURL，请求打到
+      // api.deepseek.com 要一个 glm-4，必然失败。model 相同的多条凭证也无从区分。
+      let chatCustomCredId = localStorage.getItem('claude_custom_cred_id') || '';
+      // ultracode（多智能体编排）会话级开关。刻意不落 localStorage 全局默认：新会话永远从关开始，
+      // 否则在 A 会话开了编排做大重构、切到 B 问个小问题，B 的每条消息也会去拉工作流烧额度。
+      // 持久化与还原完全照 chatMode 的流程：recordMessage 快照 / persistPrefsToConv 写穿 / applySessionPrefs 还原。
+      let chatUltracode = false;
+      // 设计稿精确还原：会话级开关，与 chatUltracode 同策略（不落 localStorage，新会话从关开始）。
+      // 理由相同：在 A 会话开着还原设计稿，切到 B 问别的问题不该被拼上还原指令。
+      let chatFigmaRestore = false;
+      let chatActiveTokenLabel = ''; // 当前激活 token 的名称，由 initUiPrefs 从服务端填充
+
+      // 额度状态圆点（topbar 右侧，替代原 #ratelimit）
+      const _cpContainer = document.getElementById('contextProgress');
+      const contextProgress = _cpContainer
+        ? new ContextProgress(_cpContainer)
+        : null;
+
+      // ---- UI 偏好持久化（服务端 settings.json，跨重启/跨浏览器） ----
+      let _saveUiPrefsTimer = null;
+      /** 将当前 cwd / model / effort / mode 写入服务端配置（300ms 防抖） */
+      function saveUiPrefs() {
+        clearTimeout(_saveUiPrefsTimer);
+        _saveUiPrefsTimer = setTimeout(() => {
+          fetch('/api/settings', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ section: 'ui-prefs', defaultCwd: cwd, model: chatModel, effort: chatEffort, mode: chatMode, disabledTools: chatDisabledTools }),
+          }).catch(() => {}); // 静默失败：localStorage 已有副本，不影响使用
+        }, 300);
+      }
+      // 会话是否已接管 cwd/模型/强度/模式：一旦打开过会话，全局默认偏好就不得再覆盖它们。
+      // 详见 initUiPrefs 里的启动竞态说明。
+      let _prefsOwnedByConv = false;
+
+      /**
+       * 启动时从服务端加载 UI 偏好，并以服务端值（非默认值时）覆盖 localStorage。
+       * 策略：服务端显式设过的值优先（跨重启恢复）；服务端仍是默认值时保留 localStorage（兼容升级前已有偏好）。
+       */
+      async function initUiPrefs() {
+        // 启动竞态守卫：initChat 里 `setTimeout(() => openConv(c.id), 0)` 必然早于这次网络往返，
+        // 而 openConv 会把 cwd/模型/强度/模式还原成**该会话自己的**值。
+        // 后到的全局默认值若照单覆盖，表现就是「刷新回到会话 A，目录标签随后跳成 B，
+        // 此后在 A 会话里发的消息实际在 B 目录执行」——数据面事故，不只是显示错乱。
+        // 注意两点：① _urlCwd 只在项目窗口有值，主窗口没有这层保护；
+        // ② 光比对快照不够——initChat 仅在 `c.cwd === cwd` 时才开会话，
+        //    此时 cwd 没变化，快照比对会误判为「没人动过」。故用显式归属标记。
+        const snap = { cwd, chatModel, chatEffort, chatMode };
+        try {
+          const r = await fetch('/api/settings');
+          if (!r.ok) return;
+          const data = await r.json();
+          // 缓存当前激活 token 的名称，用于对话气泡的发送者标签
+          if (data.active && data.active.label) chatActiveTokenLabel = data.active.label;
+          const prefs = data.uiPrefs || {};
+          let changed = false;
+          // URL 定向的项目窗口不被全局默认目录覆盖（一窗一项目）
+          if (_urlCwd == null && !_prefsOwnedByConv && cwd === snap.cwd && prefs.defaultCwd && prefs.defaultCwd !== cwd) {
+            cwd = prefs.defaultCwd;
+            lsSet('claude_cwd', cwd);
+            reinitializeGitSelector(); // 目录被服务端默认值改写：分支必须跟着重扫，否则停在上一个目录的结论
+            changed = true;
+          }
+          if (!_prefsOwnedByConv && chatModel === snap.chatModel && prefs.model && prefs.model !== 'auto' && MODEL_LABELS[prefs.model] && prefs.model !== chatModel) {
+            chatModel = prefs.model;
+            lsSet('claude_model', chatModel);
+            changed = true;
+          }
+          if (!_prefsOwnedByConv && chatEffort === snap.chatEffort && prefs.effort && prefs.effort !== 'medium' && EFFORTS.includes(prefs.effort) && prefs.effort !== chatEffort) {
+            chatEffort = prefs.effort;
+            lsSet('claude_effort', chatEffort);
+            changed = true;
+          }
+          if (!_prefsOwnedByConv && chatMode === snap.chatMode && prefs.mode && prefs.mode !== 'default' && MODES.includes(prefs.mode) && prefs.mode !== chatMode) {
+            chatMode = prefs.mode;
+            lsSet('claude_mode', chatMode);
+            changed = true;
+          }
+          if (changed) { refreshDirLabel(); syncModelUI(); }
+          // 加载服务端持久化的禁用工具列表（覆盖 localStorage，保持跨重启一致）
+          if (Array.isArray(prefs.disabledTools)) {
+            chatDisabledTools = prefs.disabledTools;
+            lsSet('claude_disabled_tools', JSON.stringify(chatDisabledTools));
+          }
+        } catch (e) {
+          console.warn('[initUiPrefs] 加载失败，使用 localStorage 值:', e);
+        }
+      }
+
+      // ---- 工作目录标签 ----
+      function baseName(p) {
+        if (!p) return '服务目录';
+        const parts = p.replace(/[\\/]+$/, '').split(/[\\/]/);
+        return parts[parts.length - 1] || p;
+      }
+      function refreshDirLabel() {
+        $('#dirLabel').textContent = baseName(cwd);
+        $('#dirLabel').title = cwd || '(服务所在目录)';
+        syncWindowTitle();
+      }
+      // 窗口标题 = 项目名：无边框窗口没有可见标题栏，这个标题只在任务栏/Alt-Tab 里出现，
+      // 多开项目窗口时用来区分是哪个项目（非 Tauri 环境退化为改 document.title，浏览器标签同样受益）。
+      function syncWindowTitle(retry = 0) {
+        const name = baseName(cwd);
+        document.title = name;
+        const api = window.tauriApi;
+        if (api?.isTauri && api.invoke) {
+          api.invoke('win_set_title', { title: name }).catch((e) => {
+            console.warn('[WinTitle] win_set_title 失败:', e?.message || e);
+          });
+          return;
+        }
+        // window.tauriApi 由 tauri-init 的异步 IIFE 产出（内含 CDN import，可能晚于这里），
+        // 桌面环境下重试几次，否则标题会停在 Rust 给的初始值。
+        // 重试时重新读 cwd，所以晚到的回调也只会写当前项目名，不会覆盖成旧值。
+        if (typeof window.__TAURI_INTERNALS__ !== 'undefined' && retry < 5) {
+          setTimeout(() => syncWindowTitle(retry + 1), 400);
+        }
+      }
+
+
+      // 检测并折叠单条消息气泡（height > 240px 时显示末尾内容）
+      function _maybeFoldBubble(msgEl) {
+        const bubble = msgEl.querySelector('.bubble');
+        if (!bubble || bubble.classList.contains('msg-folded')) return;
+        if (bubble.scrollHeight <= 240) return;
+
+        // 遮罩容器（sticky 贴顶，纯 CSS 渐变，不依赖 backdrop-filter 避免渲染层异常）
+        const overlay = document.createElement('div');
+        overlay.className = 'msg-blur-overlay';
+
+        const expandLabel = document.createElement('div');
+        expandLabel.className = 'msg-expand-label';
+        expandLabel.textContent = '展开全文';
+        overlay.appendChild(expandLabel);
+
+        // 折叠时禁止 wheel/touch 滚动（overflow:scroll 保留让 scrollTop 可设，但阻断用户操作）
+        const preventScroll = (e) => { e.preventDefault(); };
+        bubble.addEventListener('wheel', preventScroll, { passive: false });
+        bubble.addEventListener('touchmove', preventScroll, { passive: false });
+
+        overlay.addEventListener('click', (e) => {
+          e.stopPropagation();
+          bubble.classList.remove('msg-folded');
+          bubble.removeEventListener('wheel', preventScroll);
+          bubble.removeEventListener('touchmove', preventScroll);
+          overlay.remove();
+        });
+
+        bubble.prepend(overlay);
+        bubble.classList.add('msg-folded');
+        bubble.scrollTop = bubble.scrollHeight;
+      }
+
+      // 对消息区所有消息（除最后一条）检测并应用气泡折叠
+      // 用 requestAnimationFrame 确保 DOM 已完成布局，scrollHeight 有效
+      function _applyBubbleFolding() {
+        requestAnimationFrame(() => {
+          const msgs = Array.from(messagesEl.querySelectorAll('.msg:not(.collapsed)'));
+          // 最后一条消息始终完全展示，不折叠
+          for (let i = 0; i < msgs.length - 1; i++) {
+            _maybeFoldBubble(msgs[i]);
+          }
+        });
+      }
+
+      // 更新"加载更早消息"按钮内容；显示时机由滚动监听控制（滚到顶才露出）
+      function _updateLoadMoreMsgsBtn() {
+        if (_msgPagingOffset >= _msgPagingTotal) {
+          _loadMoreMsgsEl.style.display = 'none';
+          _loadMoreMsgsEl.innerHTML = '';
+          return;
+        }
+        _loadMoreMsgsEl.innerHTML = '';
+        const btn = document.createElement('button');
+        btn.className = 'load-more-msgs-btn';
+        const remaining = _msgPagingTotal - _msgPagingOffset;
+        btn.textContent = `加载更早消息（还有 ${remaining} 条）`;
+        btn.addEventListener('click', _loadEarlierMsgs);
+        _loadMoreMsgsEl.appendChild(btn);
+        // 初始隐藏，等滚动到顶部才显示
+        _loadMoreMsgsEl.style.display = 'none';
+      }
+
+      // 滚动到顶（scrollTop < 50px）时才展示"加载更早消息"按钮
+      messagesEl.addEventListener('scroll', () => {
+        if (_msgPagingOffset >= _msgPagingTotal) return;
+        _loadMoreMsgsEl.style.display = messagesEl.scrollTop < 50 ? 'flex' : 'none';
+      }, { passive: true });
+
+      // 向前加载30条历史消息，prepend 到消息区顶部
+      async function _loadEarlierMsgs() {
+        if (!_msgPagingMsgs || _msgPagingOffset >= _msgPagingTotal) return;
+        // 记录滚动位置，加载后恢复（避免视图跳动）
+        // 必须在循环前同时保存 scrollTop 和 scrollHeight：
+        // addMessage 内部每次调用 scrollBottom()，循环结束后 scrollTop 已被污染为底部值
+        const prevScrollTop = messagesEl.scrollTop;
+        const prevScrollHeight = messagesEl.scrollHeight;
+        const newOffset = Math.min(_msgPagingOffset + 30, _msgPagingTotal);
+        const batch = _msgPagingMsgs.slice(_msgPagingTotal - newOffset, _msgPagingTotal - _msgPagingOffset);
+        // 临时隐藏溢出，防止 addMessage 内的 scrollBottom 造成可见闪烁
+        messagesEl.style.overflow = 'hidden';
+        // 在现有第一条消息之前 prepend
+        // 注意：addMessage 会将气泡追加到 bubbleMap 末尾（bubblePush），
+        // 但 insertBefore 使 DOM 顺序与 bubbleMap 顺序相反。
+        // 这在有存活流式任务的会话中会破坏「存储索引=DOM索引=bubbleMap索引」不变量——
+        // openConv 通过 _hasPending 守卫将此类会话降级为全量渲染，保证不进入此路径。
+        const firstMsg = messagesEl.querySelector('.msg');
+        for (const m of batch) {
+          // 本地会话消息用 .text 字段（兼容早期落库的 .content）
+          const text = m.text ?? m.content ?? '';
+          const msgEl = await addMessage(m.role, text, m);
+          if (firstMsg) messagesEl.insertBefore(msgEl, firstMsg);
+        }
+        messagesEl.style.overflow = ''; // 恢复 overflow
+        // 使用循环前保存的两个值恢复位置（不读循环后的 scrollTop，已被 scrollBottom 污染）
+        messagesEl.scrollTop = prevScrollTop + (messagesEl.scrollHeight - prevScrollHeight);
+        _msgPagingOffset = newOffset;
+        _updateLoadMoreMsgsBtn();
+        _applyBubbleFolding();
+      }
+
+      // ---- 对话历史（localStorage 持久化，展示于左侧栏）----
+
+
+      let currentConvId = null;
+      // 本应用自己维护的会话列表（localStorage 的 claude_convs）。不再读 ~/.claude/projects
+      // 下的磁盘会话文件做回填——那些文件里混着大量自动任务创建的会话，会污染左侧列表。
+      // 一窗一项目：只显示 cwd 匹配本窗目录的会话（其他项目在各自窗口，切目录=开新窗）。
+      // 返回统一条目：{ source:'local', convId, sessionId, title, updatedAt, running, active, pinned }
+      function buildConvEntries() {
+        const convs = loadConvs();
+        const curCwd = cwd || '';
+        const entries = [];
+        for (const c of convs) {
+          const isRunning = !!runningJobs[c.id];
+          // 一窗一项目：非本窗目录的会话不显示（含运行中——本窗 runningJobs 只含本窗 cwd 的 run，天然不会误伤）
+          if ((c.cwd || '') !== curCwd && !isRunning) continue;
+          // 需求 conv（createReqConv 产生，meta.reqId 打标）走侧栏「本次需求」列表，不进普通会话列表
+          if (c.meta && c.meta.reqId) continue;
+          entries.push({
+            source: 'local',
+            convId: c.id,
+            sessionId: c.session || null,
+            title: c.title || '未命名对话',
+            updatedAt: c.updatedAt || 0,
+            running: isRunning,
+            active: c.id === currentConvId && _isChatViewActive(),
+            pinned: c.pinned || false,
+          });
+        }
+        entries.sort((a, b) => b.updatedAt - a.updatedAt);
+        return entries;
+      }
+      // 由一条会话条目构造左栏行元素
+      function makeConvRow(e) {
+        const row = document.createElement('div');
+        row.className =
+          'conv-item' +
+          (e.active ? ' active' : '') +
+          (e.running ? ' running' : '') +
+          (e.pinned ? ' user-pinned' : '');
+        row.dataset.convId = e.convId;
+        row.dataset.sessionId = e.sessionId || '';
+        row.dataset.pinned = e.pinned ? '1' : '';
+        // 钉住图标（用户手动置顶时显示）
+        if (e.pinned) {
+          const pinIc = document.createElement('span');
+          pinIc.className = 'conv-pin-ic';
+          pinIc.title = '已钉住';
+          pinIc.innerHTML = PIN_ICON_SVG;
+          row.appendChild(pinIc);
+        }
+        const title = document.createElement('span');
+        title.className = 'conv-title';
+        // 标题文字（flex 子元素，超长截断）
+        const titleText = document.createElement('span');
+        titleText.className = 'title-text';
+        titleText.textContent = e.title;
+        title.appendChild(titleText);
+        titleText.dataset.convId = e.convId; // 便于后续查找
+        // onclick 挂 row（整行），与 cursor:pointer 语义一致——任何位置点击都切换会话，
+        // 避免"点标题右侧空白区域无反应但光标已是手型"的视觉歧义（原挂 title 的问题）。
+        row.onclick = () => openConv(e.convId);
+        row.appendChild(title);
+        // 右侧 info 图标：hover 展示时间（缺少 updatedAt 则不渲染）
+        if (e.updatedAt && e.updatedAt > 0) {
+          const infoWrap = document.createElement('span');
+          infoWrap.className = 'conv-info';
+          const infoImg = document.createElement('span');
+          infoImg.className = 'conv-info-icon';
+          infoImg.innerHTML = '<svg viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M512 64c126.72 3.328 232.192 47.168 316.48 131.456C912.832 279.872 956.672 385.344 960 512c-3.328 126.72-47.168 232.192-131.52 316.48C744.192 912.832 638.72 956.672 512 960c-126.72-3.328-232.192-47.168-316.544-131.52C111.232 744.192 67.392 638.72 64 512c3.328-126.72 47.168-232.192 131.456-316.544C279.872 111.232 385.344 67.392 512 64z m67.008 275.008a61.44 61.44 0 0 0 43.008-15.488c11.328-10.304 17.024-24.128 17.024-41.472s-5.696-31.232-17.024-41.536a60.672 60.672 0 0 0-42.496-15.488 60.672 60.672 0 0 0-42.496 15.488c-11.328 10.304-16.96 24.192-16.96 41.536 0 17.28 5.632 31.168 16.96 41.472a60.032 60.032 0 0 0 41.984 15.488z m12.032 360c0-4.032 0.32-9.344 0.96-16 0.64-6.656 0.64-12.992 0-19.008l-52.992 60.992c-5.312 6.016-10.88 10.688-16.512 14.016-5.696 3.328-10.496 4.352-14.464 3.008-6.016-2.688-8.704-7.36-8-14.016l88-276.992c3.264-18.688 0.32-34.688-9.024-48-9.344-13.312-24.32-21.312-44.992-24-23.36 0.64-48.832 10.496-76.48 29.504-27.712 19.008-51.84 43.2-72.512 72.512v14.976c-0.64 6.72-0.64 13.056 0 19.008l52.928-60.992c5.376-5.952 10.88-10.624 16.512-14.016 5.76-3.328 10.24-4.288 13.568-2.944 6.656 3.264 8.96 8.64 6.976 16l-87.04 275.968a49.664 49.664 0 0 0 7.04 44.48c9.344 13.056 25.664 21.888 49.024 26.56 33.28-0.64 61.312-10.368 83.968-29.056a321.92 321.92 0 0 0 63.04-72z" fill="currentColor"></path></svg>';
+          const infoTip = document.createElement('span');
+          infoTip.className = 'conv-info-tip';
+          try {
+            infoTip.textContent = new Date(e.updatedAt).toLocaleString('zh-CN', { hour12: false });
+          } catch {
+            infoTip.textContent = '';
+          }
+          infoWrap.appendChild(infoImg);
+          infoWrap.appendChild(infoTip);
+          row.appendChild(infoWrap);
+        }
+        return row;
+      }
+      // 小节标题（「置顶」「今天」等分组头）
+      function makeConvSectionLabel(text) {
+        const label = document.createElement('div');
+        label.className = 'conv-section-label';
+        label.textContent = text;
+        return label;
+      }
+      // 渲染左侧会话列表：钉住的会话单列「置顶」小节，其余交给 conv-groups.logic 按天分「今天 / 昨天 / 更早」小节。
+      // 数据源只有本应用维护的会话（localStorage），不再合并磁盘 CLI 会话。
+      function renderConvList() {
+        const el = $('#convList');
+        const allEntries = buildConvEntries(); // 已按 updatedAt 倒序、按 cwd 过滤到本窗项目
+        el.innerHTML = '';
+        const frag = document.createDocumentFragment();
+
+        // 钉住的会话始终置顶；其余保持 updatedAt 倒序
+        const pinned = allEntries.filter((e) => e.pinned);
+        if (pinned.length) {
+          frag.appendChild(makeConvSectionLabel('置顶'));
+          for (const e of pinned) frag.appendChild(makeConvRow(e));
+        }
+
+        // 按天分组渲染；空分组不渲染标题
+        for (const group of groupConvsByDay(allEntries.filter((e) => !e.pinned))) {
+          frag.appendChild(makeConvSectionLabel(group.label));
+          for (const e of group.items) frag.appendChild(makeConvRow(e));
+        }
+
+        if (!allEntries.length) {
+          const empty = document.createElement('div');
+          empty.className = 'conv-empty';
+          empty.textContent = '暂无对话';
+          frag.appendChild(empty);
+        }
+        el.appendChild(frag);
+      }
+      /** 立即重渲会话列表（供 app.js 视图切换时调用），不走防抖 */
+export function renderConvListNow() {
+  renderConvList();
+}
+      /** 防抖版 renderConvList：流式输出期间合批，200ms 内多次调用只渲染最后一次 */
+      const renderConvListDebounced = debounce(renderConvList, 200);
+      // 别的项目窗口写了同一个 claude_convs（多窗共享整表键）：镜像已被 conv-store 作废，
+      // 这里把左栏重画一遍——否则本窗要等到自己下次动手才看得见别人的新会话。
+      onConvsChange(() => renderConvListDebounced.flush());
+      // ---- 会话右键菜单：钉住 / 重命名 / 删除 ----
+      const _ctxMenu = (() => {
+        const el = document.createElement('div');
+        el.className = 'conv-ctx-menu';
+        el.hidden = true;
+        el.innerHTML =
+          '<button class="ctx-item" id="ctxPin"></button>' +
+          '<button class="ctx-item" id="ctxRename">重命名</button>' +
+          '<button class="ctx-item ctx-danger" id="ctxDelete">删除</button>';
+        document.body.appendChild(el);
+        return el;
+      })();
+      let _ctxConvId = null; // 当前右键的 convId
+
+      function _hideCtxMenu() {
+        _ctxMenu.hidden = true;
+        _ctxConvId = null;
+      }
+
+      function _showCtxMenu(x, y, convId, isPinned) {
+        _ctxConvId = convId;
+        _ctxMenu.querySelector('#ctxPin').textContent = isPinned ? '取消钉住' : '钉住';
+        // 先显示再定位，确保能拿到尺寸
+        _ctxMenu.hidden = false;
+        const mw = _ctxMenu.offsetWidth;
+        const mh = _ctxMenu.offsetHeight;
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        _ctxMenu.style.left = (x + mw > vw ? vw - mw - 6 : x) + 'px';
+        _ctxMenu.style.top  = (y + mh > vh ? vh - mh - 6 : y) + 'px';
+      }
+
+      // 钉住 / 取消钉住
+      function _convPin(convId, shouldPin) {
+        // mutateConvs：以 localStorage 最新内容为底改动（多窗口共享整表键，不能用旧镜像覆盖）
+        const ok = mutateConvs((list) => {
+          const c = list.find((x) => x.id === convId);
+          if (!c) return false;
+          c.pinned = shouldPin;
+        });
+        if (!ok) return;
+        renderConvListDebounced.flush();
+        toast(shouldPin ? '已钉住' : '已取消钉住');
+      }
+
+      // 重命名
+      async function _convRename(convId) {
+        const cur = loadConvs().find((x) => x.id === convId);
+        if (!cur) return;
+        const newTitle = await promptDialog({
+          title: '重命名对话',
+          value: cur.title || '',
+          placeholder: '输入新名称',
+          confirmText: '保存',
+        });
+        if (newTitle == null) return; // 取消
+        const trimmed = newTitle.trim();
+        if (!trimmed) return;
+        // 弹框是 await 出来的：期间别的窗口可能改过表，改动必须落到最新内容上（见 conv-store 顶部说明）
+        mutateConvs((list) => {
+          const c = list.find((x) => x.id === convId);
+          if (!c) return false;
+          c.title = trimmed;
+        });
+        renderConvListDebounced.flush();
+      }
+
+      // 删除
+      async function _convDelete(convId) {
+        const ok = await confirmDialog({
+          title: '删除对话',
+          message: '此操作将永久删除该对话记录，无法恢复。',
+          confirmText: '删除',
+          danger: true,
+        });
+        if (!ok) return;
+        // 删除同样要落在最新内容上：确认框 await 期间别的窗口可能新建/改写过（删错整表就是灾难）
+        const removed = mutateConvs((list) => {
+          const idx = list.findIndex((x) => x.id === convId);
+          if (idx < 0) return false;
+          list.splice(idx, 1);
+        });
+        if (!removed) return;
+        if (convId === currentConvId) {
+          newConversation();
+        } else {
+          renderConvListDebounced.flush();
+        }
+        toast('已删除');
+      }
+
+      // 菜单按钮事件
+      _ctxMenu.querySelector('#ctxPin').addEventListener('click', () => {
+        if (!_ctxConvId) return;
+        const list = loadConvs();
+        const c = list.find((x) => x.id === _ctxConvId);
+        _convPin(_ctxConvId, !(c && c.pinned));
+        _hideCtxMenu();
+      });
+      _ctxMenu.querySelector('#ctxRename').addEventListener('click', () => {
+        const id = _ctxConvId;
+        _hideCtxMenu();
+        _convRename(id);
+      });
+      _ctxMenu.querySelector('#ctxDelete').addEventListener('click', () => {
+        const id = _ctxConvId;
+        _hideCtxMenu();
+        _convDelete(id);
+      });
+
+      // 点其他地方关闭
+      document.addEventListener('click', (e) => {
+        if (!_ctxMenu.hidden && !_ctxMenu.contains(e.target)) _hideCtxMenu();
+      });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') _hideCtxMenu();
+      });
+
+      function recordMessage(role, text) {
+        if (!currentConvId) return;
+        // 新会话的那次写入尤其不能拿旧镜像覆盖：别的项目窗口只要落后一点，整表覆盖就会把
+        // 那边刚建的会话一起抹掉（mutateConvs 以最新内容为底，见 conv-store 顶部说明）
+        mutateConvs((list) => {
+          let c = list.find((x) => x.id === currentConvId);
+          if (!c) {
+            c = { id: currentConvId, title: '', session: null, cwd: '', messages: [], updatedAt: 0 };
+            list.push(c);
+          }
+          // 用首条用户消息作为标题
+          if (role === 'user' && !c.messages.some((m) => m.role === 'user')) {
+            c.title = text.slice(0, 30);
+          }
+          c.messages.push({ role, text });
+          c.session = currentSession;
+          c.cwd = cwd;
+          c.model = chatModel;
+          c.effort = chatEffort;
+          c.mode = chatMode;
+          c.provider = chatProvider;
+          c.customModel = chatCustomModel;
+          c.customLabel = chatCustomLabel;
+          c.customCredId = chatCustomCredId;
+          c.ultracode = chatUltracode; // 每条消息都快照（与 model/mode 同款）；首条消息建会话记录时也会写入，解决「会话还没建就先开了开关」的时序
+          c.figmaRestore = chatFigmaRestore;
+          c.updatedAt = Date.now();
+        });
+        renderConvListDebounced();
+      }
+      /**
+       * 需求寄生会话（Task 10）：为需求创建一个不进普通会话列表的 conv（buildConvEntries
+       * 按 meta.reqId 过滤）。字段形状对齐 recordMessage 的建 conv 块；session 传入 devSession
+       * 可跨浏览器续接同一开发会话。不调 renderConvList——本就不该出现在列表里。
+       * @returns {string} convId
+       */
+      export function createReqConv({ id, reqId, cwd: reqCwd, session, title, kind = 'sub', seedPending = false, seedText = '' }) {
+        const newId = id || 'c' + String(Date.now());
+        // 服务端起的子会话（colleague-dev）先于本地存在：按既定 id 补建；已有同 id 直接返回，防重复插入。
+        // 判重也必须在最新内容上做：旧镜像里看不到别的窗口刚建的同一 id。
+        const list = mutateConvs((all) => {
+          if (id && all.some((c) => c.id === id)) return false;
+          all.push({
+            id: newId,
+            title: title || '需求会话',
+            session: session || null,
+            cwd: reqCwd || '',
+            messages: [],
+            updatedAt: Date.now(),
+            meta: { reqId, kind, seedPending, seedText },
+            // 需求系统任务固定跑 Claude；显式声明可防 openai-compat 用户打开需求会话时
+            // applySessionPrefs 把缺失 provider 归一成 claude-agent 并静默写穿 localStorage
+            provider: 'claude-agent',
+          });
+        });
+        return list ? newId : id; // 已存在：原样返回传入的 id
+      }
+      // 写穿：右下角改动立即写入当前会话记录（不等下一条消息快照），杜绝切走再切回被还原
+      function persistPrefsToConv() {
+        if (!currentConvId) return;
+        mutateConvs((list) => {
+          const c = list.find((x) => x.id === currentConvId);
+          if (!c) return false;
+          c.model = chatModel;
+          c.effort = chatEffort;
+          c.mode = chatMode;
+          c.provider = chatProvider;
+          c.customModel = chatCustomModel;
+          c.customLabel = chatCustomLabel;
+          c.customCredId = chatCustomCredId;
+          c.ultracode = chatUltracode;
+          c.figmaRestore = chatFigmaRestore;
+          // 不动 updatedAt：纯偏好变更不改变左栏排序
+        });
+      }
+
+      // ---- 输入框草稿按会话隔离 ----
+      // #prompt 是页面级单例 DOM，openConv 只重建消息区、从不碰它 → 未发送的内容会被带进下一个会话。
+      // 修法与 persistPrefsToConv 同构：写穿当前会话记录，切换时「存旧 → 清 → 回填新」。
+      const NEW_DRAFT_KEY = 'claude_draft_new'; // 尚未落地成会话（currentConvId 为空）的草稿另存一处，否则误点侧栏就蒸发
+      /** 草稿变更写穿（由 composer 的 input 监听 debounce 后调用） */
+      function persistDraftToConv(html) {
+        if (currentConvId) convSetDraft(currentConvId, html);
+        else if (html) lsSet(NEW_DRAFT_KEY, html);
+        else localStorage.removeItem(NEW_DRAFT_KEY);
+      }
+      /** 取走输入框内容存进「当前」会话（必须在改写 currentConvId 之前调用）。
+       *  刻意不复用 persistDraftToConv：后者在「无会话 + 空内容」时会 removeItem，
+       *  而启动恢复（initChat 的 openConv）正是这个状态——那一下会误删上次没发出去的新对话草稿。
+       *  此处的空 stash 一律视为「无事发生」。 */
+      function stashDraftForCurrentConv() {
+        const html = stashPrompt();
+        if (currentConvId) convSetDraft(currentConvId, html);
+        else if (html) lsSet(NEW_DRAFT_KEY, html);
+      }
+      /** 已发送/已插话：草稿作废（不清会导致重开会话把已发出的话又灌回输入框） */
+      function dropDraftAfterSend(convId) {
+        if (convId) convSetDraft(convId, '');
+        localStorage.removeItem(NEW_DRAFT_KEY);
+      }
+      /**
+       * 打开某会话。
+       * @param {string} id
+       * @param {{nav?: boolean}} [opts] nav=false 时不切回聊天视图（只换会话）。
+       *   默认 true——所有用户手势路径（点侧栏行、点徽标、发送）都要跳视图，行为与历来一致。
+       *   自动路径（req 文档页 3s 轮询里「确保 conv 已打开」这类幂等调用）必须传 false：
+       *   否则用户在设置/任务/需求文档等面板停留时，会被后台轮询反复拽回聊天视图。
+       */
+      export async function openConv(id, opts = {}) {
+        const nav = opts.nav !== false;
+        if (nav) _goChat();
+        if (id === currentConvId) return;
+        const c = loadConvs().find((x) => x.id === id);
+        if (!c) return; // 目标会话不存在：原地不动，尤其不能清掉用户正在写的草稿
+        if (currentConvId) bubbleReset(currentConvId); // 离开旧会话前清理其气泡缓存，避免 detached DOM 常驻
+        stashDraftForCurrentConv(); // 存旧会话草稿并清空输入框（须早于 currentConvId 改写）
+        currentConvId = id;
+        lsSet('claude_last_conv', id); // 刷新后自动回到该会话
+        currentSession = c.session || null;
+        if (typeof c.cwd === 'string') {
+          const cwdChanged = c.cwd !== cwd;
+          cwd = c.cwd;
+          lsSet('claude_cwd', cwd);
+          refreshDirLabel();
+          // 会话可能绑在另一个项目上。分支选择器的 _currentBranch 是模块级状态，
+          // 不重扫就会把上一个项目的分支当成当前分支显示——用户据此误判要不要切分支。
+          if (cwdChanged) reinitializeGitSelector();
+        }
+        applySessionPrefs(c); // 还原该会话的模型/强度/模式（缺失或不认识则保持现状）
+        restorePrompt(c.draft); // 还原该会话未发送的草稿（无则清空，即上面 stash 后的状态）
+        _prefsOwnedByConv = true; // 此后 initUiPrefs 的迟到响应不得覆盖这些值
+        AnimeAnimations.resetToolState();
+        AnimeAnimations.stopStreamScramble();
+        messagesEl.querySelectorAll('.msg').forEach((m) => m.remove());
+        bubbleReset(id); // 清旧缓存，下面 addMessage 会重建
+        emptyEl.style.display = c.messages.length ? 'none' : '';
+        // 有 pending 流时不分页（分页会导致 bubbleAt 越界，流式输出完全不可见）
+        const _hasPending = c.messages.some((m) => m.pending && m.runId);
+        if (_hasPending || c.messages.length <= 30) {
+          // 全量渲染（原始逻辑）
+          _msgPagingMsgs = null;
+          _msgPagingTotal = 0;
+          _msgPagingOffset = c.messages.length;
+          for (const m of c.messages) await addMessage(m.role, m.text, m);
+          _loadMoreMsgsEl.style.display = 'none';
+          _applyBubbleFolding();
+        } else {
+          // 分页加载：只渲染最后30条
+          _msgPagingMsgs = c.messages;
+          _msgPagingTotal = c.messages.length;
+          _msgPagingOffset = Math.min(30, c.messages.length);
+          for (const m of c.messages.slice(-_msgPagingOffset)) await addMessage(m.role, m.text, m);
+          // 更新"加载更早消息"按钮状态
+          _updateLoadMoreMsgsBtn();
+          _applyBubbleFolding();
+        }
+        // 恢复运行态：优先接续本地后台 job；否则按 runId 重连服务端 run（关网页后仍在跑）
+        const job = runningJobs[id];
+        if (job) {
+          job.shown = job.text.length; // 返回时直接显示已有内容，不重新逐字
+          job._paintedShown = -1;
+          job._paintedStatus = '';
+          paintJob(job);
+          ensureTyping();
+        } else {
+          let attached = false;
+          for (let k = c.messages.length - 1; k >= 0; k--) {
+            const m = c.messages[k];
+            if (m.role === 'assistant' && m.pending && m.runId) {
+              attachStream(id, k, m.runId);
+              attached = true;
+              break;
+            }
+          }
+          // 无本地 pending 气泡但服务端有该会话的存活续跑（后台会话已隔离、未预塞气泡）→ 新建气泡接流
+          if (!attached) {
+            const p = pendingMap[id];
+            if (p && p.status === 'resuming' && p.runId && !handledResumes.has(p.runId)) {
+              handledResumes.add(p.runId);
+              const idx = convPushMessage(id, 'assistant', '');
+              convSetMsgFields(id, idx, { pending: true, runId: p.runId });
+              addMessage('assistant', '');
+              attachStream(id, idx, p.runId);
+            }
+          }
+        }
+        // queue-first：先对账该会话的排队卡片（离线/切走期间被投递的项在这里上屏；须先于补接流的
+        // 助手占位，保证「用户消息在前、占位在后」的转录顺序）
+        await syncQueue(id);
+        // queue-first：后台会话期间排空起的新 run（follows 记录留档）→ 打开时补助手占位并接流。
+        // 用户消息由上面的 syncQueue 对账上屏；这里只负责让新 run 的流有气泡可接。
+        {
+          const dfu = drainedFollowUps[id];
+          if (dfu && dfu.runId && !handledFollowUps.has(dfu.runId) && !runningJobs[id]) {
+            handledFollowUps.add(dfu.runId);
+            delete drainedFollowUps[id];
+            const idx = convPushMessage(id, 'assistant', '');
+            convSetMsgFields(id, idx, { pending: true, runId: dfu.runId });
+            addMessage('assistant', '');
+            attachStream(id, idx, dfu.runId);
+          }
+        }
+        updateComposerRunning();
+        renderConvListDebounced.flush(); // 切换对话须立即更新高亮
+        renderPendingBanner();
+        _reqConvHook?.(c.meta?.reqId || null); // 需求 conv → 挂横幅/右栏；普通 conv → 卸载
+        // 换会话要换收件箱轮询目标：后台会话期间收到的补充内容靠它立刻补拉一次
+        if (window.__convNotify) window.__convNotify.onConvOpened(id);
+      }
+      function newConversation() {
+        _goChat();
+        // 重置分页状态
+        _msgPagingMsgs = null;
+        _msgPagingTotal = 0;
+        _msgPagingOffset = 0;
+        _loadMoreMsgsEl.style.display = 'none';
+        window._setSidebarToolsMode?.(false); // 从工具态复位回会话列表
+        const oldId = currentConvId;
+        stashDraftForCurrentConv(); // 存旧会话草稿并清空输入框（须早于 currentConvId 置空）
+        currentConvId = null;
+        renderQueueStrip(); // 新会话没有排队卡片：收起卡片条
+        if (oldId) bubbleReset(oldId); // 清旧会话的气泡缓存（需在重置 currentConvId 前用局部变量保存）
+        localStorage.removeItem('claude_last_conv');
+        restorePrompt(localStorage.getItem(NEW_DRAFT_KEY)); // 回填上次「新对话」里没发出去的内容
+        currentSession = null;
+        chatUltracode = false; // 新会话从关开始（见变量声明处）
+        syncModelUI();
+        chatFigmaRestore = false; // 新会话从关开始（同 chatUltracode，见变量声明处）
+        syncFigmaRestoreBtn();
+        // 🔔 飞书通知是会话级偏好，新对话没有登记：同步复位勾选态并停掉旧会话的收件箱轮询
+        //（findConv(null) → refreshBtn(null) 取消勾选 + stopPolling），否则会留下「勾着但没登记」的假象
+        if (window.__convNotify) window.__convNotify.onConvOpened(null);
+        messagesEl.querySelectorAll('.msg').forEach((m) => m.remove());
+        emptyEl.style.display = '';
+        AnimeAnimations.resetToolState();
+        // 触发空页面 SVG 描边动画
+        requestAnimationFrame(() => AnimeAnimations.playVibeAnimation());
+        updateComposerRunning();
+        renderConvListDebounced.flush(); // 新建对话须立即更新高亮
+        renderPendingBanner();
+        _reqConvHook?.(null); // 新对话必然不是需求会话 → 卸载横幅/右栏
+        // 应用新会话默认值（若设置了的话）
+        (async () => {
+          try {
+            const r = await fetch('/api/settings');
+            if (!r.ok) return;
+            const d = await r.json();
+            const prefs = d.uiPrefs || {};
+            let changed = false;
+            if (prefs.defaultModel && MODEL_LABELS[prefs.defaultModel] && prefs.defaultModel !== chatModel) {
+              chatModel = prefs.defaultModel; lsSet('claude_model', chatModel); changed = true;
+            }
+            if (prefs.defaultEffort && EFFORTS.includes(prefs.defaultEffort) && prefs.defaultEffort !== chatEffort) {
+              chatEffort = prefs.defaultEffort; lsSet('claude_effort', chatEffort); changed = true;
+            }
+            if (prefs.defaultMode && MODES.includes(prefs.defaultMode) && prefs.defaultMode !== chatMode) {
+              chatMode = prefs.defaultMode; lsSet('claude_mode', chatMode); changed = true;
+            }
+            if (changed) syncModelUI();
+          } catch { /* 静默失败 */ }
+        })();
+      }
+
+      // ---- 会话消息模型 & 运行态操作（支持后台并行会话）----
+      // 当前可见消息区中第 index 条消息的气泡（优先走 Map 缓存，O(1)）
+      // index 是存储索引；分页模式下存储索引≠DOM索引，需按"未渲染消息数"做偏移换算。
+      // _msgPagingTotal>0 表示分页激活；unrendered = total - offset 即未加载进 DOM 的消息数。
+      // 新发消息加入存储后 total/offset 未同步更新，但差值不变，换算仍然正确。
+      function bubbleAt(index) {
+        const unrendered = _msgPagingTotal > 0 ? _msgPagingTotal - _msgPagingOffset : 0;
+        const domIndex = unrendered > 0 ? index - unrendered : index;
+        if (currentConvId) {
+          const b = bubbleGet(currentConvId, domIndex);
+          if (b) return b;
+        }
+        // 降级：Map 未命中时回退线性扫描（兼容边界情况）
+        const msg = messagesEl.querySelectorAll('.msg')[domIndex];
+        return msg ? msg.querySelector('.bubble') : null;
+      }
+      // 依据当前会话是否运行，切换发送/停止按钮；同步 Lottie 动画（任意会话运行中即播放）
+      function updateComposerRunning() {
+        const job = currentConvId ? runningJobs[currentConvId] : null;
+        // 运行中不再禁发：消息默认排队（等当前任务完整结束后自动执行）；
+        // 想立即送达点排队卡片上的「立即发送」（steer-now）。仅 start 往返期间短暂禁用。
+        sendBtn.disabled = !!(job && !job.runId);
+        sendBtn.title = job ? (job.runId ? '发送：当前任务运行中，消息将排队（自动执行，或点卡片「立即发送」插进当前任务）' : '正在启动，稍候可发送') : '发送';
+        stopBtn.hidden = !job;
+      }
+      // 结束某会话运行任务（关连接 + 定稿 markdown + 停打字机 + 更新侧栏）
+      function endJob(convId, isErr) {
+        const job = runningJobs[convId];
+        if (!job) return;
+        // 清除停止中状态：取消延迟定时器 + 移除遮罩 + 恢复按钮
+        if (job._stoppingTimer) clearTimeout(job._stoppingTimer);
+        hideStoppingOverlay();
+        stopBtn.disabled = false;
+        stopBtn.textContent = '停止';
+        try {
+          job.es.close();
+        } catch {}
+        if (convId === currentConvId) {
+          const vb = bubbleAt(job.asstIndex);
+          if (vb) {
+            AnimeAnimations.stopStreamScramble(); // 停流式 scramble，避免落定回写到已定稿内容
+            renderMarkdown(vb, job.text.slice(job.base)); // 定稿：本段完整 markdown、去掉运行状态行
+            if (isErr) {
+              vb.classList.add('err');
+              // 异常时显示异常状态吉祥物 + 面板
+              AnimeAnimations.showMascotStatus('error', '任务执行异常，请查看错误信息');
+              AnimeAnimations.setMascotState('error');
+              // 异常不自动消失
+            } else {
+              // 成功完成时显示成功状态
+              AnimeAnimations.showMascotStatus('success', '任务已成功完成');
+              AnimeAnimations.setMascotState('success');
+              // 发送系统通知（Tauri 环境）
+              if (window.notifyUser) {
+                window.notifyUser(
+                  'Task Completed',
+                  `"${loadConvs().find((c) => c.id === convId)?.title || 'Task'}" execution finished`,
+                  { icon: 'success', convId }
+                );
+              }
+              // 3秒后恢复默认状态 + 隐藏面板
+              setTimeout(() => {
+                if (currentConvId === convId) {
+                  AnimeAnimations.setMascotState('');
+                  AnimeAnimations.hideMascotStatus();
+                }
+              }, 3000);
+            }
+          }
+          if (typeTimer) {
+            clearInterval(typeTimer);
+            typeTimer = null;
+          }
+        }
+        delete runningJobs[convId];
+        if (convId === currentConvId) updateComposerRunning();
+        renderConvListDebounced();
+        // Task 4：run 完成时更新侧栏运行灯
+        if (window._updateReqList) {
+          window._updateReqList();
+        }
+        refreshAskChip(); // job 结束：挂起审批随之消失，刷新徽标
+        // run 结束立刻刷一次「本次会话改动」计数：否则徽标最长要等 15s 轮询周期，
+        // 而「跑完改了啥」正是此刻最想看到的东西（面板自身 5s 轮询，这里管的是顶栏）
+        window._refreshChangesBadge?.();
+      }
+
+      // ---- 路径检测与渲染 ----
+      // 只识别绝对路径。相对路径没有可靠锚点，在中文语境里跟正常文本无法区分，
+      // 一律不识别（例如「是否有宠物/宝宝」的斜杠是「或」的意思，不是路径分隔符）。
+      //
+      // 三条规则的共同约束：
+      // 1. 必须以行首或空白/引号/括号开头 —— 挡掉句子中间的斜杠（宠物/宝宝）
+      // 2. 遇空白即截断 —— 带空格的路径只能识别到第一段，宁可少认不可错认
+      // 3. 中文标点不算路径字符 —— 中文里逗号后不跟空格，否则「C:\a.txt，然后」会整句被吞
+      const PATH_SEP_HEAD = '(^|[\\s"\'(\\[{（【])';
+      // Windows 路径允许中文文件名（有 C:\ 强锚点，误判风险低），但排除中文标点
+      const WIN_BODY = '[^\\s"\'<>|*?\\n，。；：！？、（）【】《》]';
+      const PATH_PATTERNS = [
+        // Windows 盘符绝对路径：C:\... 或 C:/...
+        new RegExp(PATH_SEP_HEAD + '([A-Za-z]:[\\\\/]' + WIN_BODY + '*)', 'g'),
+        // Windows UNC：\\server\share\...
+        new RegExp(PATH_SEP_HEAD + '(\\\\\\\\' + WIN_BODY + '+)', 'g'),
+        // Unix/Mac 绝对路径：无强锚点，故限定纯 ASCII 路径字符且至少两级（/home/user）
+        new RegExp(PATH_SEP_HEAD + '((?:\\/[A-Za-z0-9._+@~%-]+){2,}\\/?)', 'g'),
+      ];
+      // 路径尾部粘连的标点：句号、括号、引号等都不是路径的一部分
+      const TRAILING_PUNCT = /[.,;:!?、，。；：！？)）\]】》>"'`]+$/;
+      const IMAGE_EXTS = /\.(png|jpg|jpeg|gif|webp|bmp|svg)$/i;
+
+      /**
+       * 剥掉路径尾部粘连的标点。
+       * 注意：Windows 盘符根（C:\）剥完仍然有效，所以只在剥空时放弃。
+       */
+      function stripTrailingPunct(path) {
+        return path.replace(TRAILING_PUNCT, '');
+      }
+
+      /**
+       * 扩展名后面直接粘中文时，在扩展名处截断。
+       *
+       * 中文输入里「C:\x\y.png这张图」这样不打空格是常态，光靠空白和标点截不住。
+       * 贪婪匹配保证取最后一个扩展名，所以中文目录名（C:\项目\说明.md）不受影响——
+       * 那里的扩展名后面是结尾而非中文。
+       */
+      function cutAtExtension(path) {
+        const m = path.match(/^(.*\.[A-Za-z0-9]{1,8})[一-鿿぀-ヿ]/);
+        return m ? m[1] : path;
+      }
+
+      /**
+       * 剥离标点后的兜底复检：确认它仍然是个绝对路径。
+       */
+      function isAbsolutePath(path) {
+        if (!path || path.length < 3) return false;
+        if (/^[A-Za-z]:[\\/]/.test(path)) return true;      // C:\ 或 C:/
+        if (/^\\\\[^\\]/.test(path)) return true;            // UNC
+        if (/^(?:\/[^/]+){2,}\/?$/.test(path)) return true;  // /a/b
+        return false;
+      }
+
+      /**
+       * 提取路径最后一段作为显示名
+       */
+      function getPathName(path) {
+        const lastSeg = path.split(/[/\\]/).filter(Boolean).pop() || path;
+        return lastSeg;
+      }
+
+      /**
+       * 判断是否为图片扩展名
+       */
+      function isImagePath(path) {
+        return IMAGE_EXTS.test(path);
+      }
+
+      /**
+       * 把本地绝对路径转成 WebView 能加载的 URL。
+       *
+       * convertFileSrc 在 Tauri v2 里属于 core 模块，旧代码写的 __TAURI__.path
+       * 下面没有这个函数，取值恒为 undefined，于是一路退到 file:///——
+       * 而 WebView 出于安全会拒载 file://，缩略图必然是破图。
+       *
+       * @returns {string|null} 拿不到可用的转换器时返回 null，调用方据此放弃渲染图片
+       */
+      function toWebviewUrl(path) {
+        const convert = window.__TAURI__?.core?.convertFileSrc
+          || window.__TAURI__?.tauri?.convertFileSrc;  // v1 兼容
+        return convert ? convert(path) : null;
+      }
+
+      /**
+       * 创建图片缩略图 DOM。
+       * 加载失败时（路径不存在、格式不支持、权限不足）原地降级成文件 chip——
+       * 没有 path_exists 可用，img.onerror 就是唯一的存在性信号。
+       */
+      function makeImageElement(path, src) {
+        const img = document.createElement('img');
+        img.className = 'path-img';
+        img.alt = getPathName(path);
+        img.dataset.path = path;
+        img.title = '点击查看完整图片';
+        img.src = src;
+
+        img.onerror = () => {
+          img.replaceWith(makePathChip(path, 'file'));
+        };
+
+        return img;
+      }
+
+      /**
+       * 创建路径 chip（文件或目录）
+       */
+      function makePathChip(path, kind) {
+        const chip = document.createElement('span');
+        chip.className = 'path-chip';
+        chip.dataset.path = path;
+
+        const icon = document.createElement('span');
+        icon.className = 'path-icon';
+
+        const name = document.createElement('span');
+        name.className = 'path-name';
+        name.textContent = getPathName(path);
+
+        if (kind === 'dir') {
+          chip.classList.add('path-dir');
+          icon.textContent = '📁';
+          chip.title = '点击在文件夹中定位';
+        } else {
+          chip.classList.add('path-file');
+          icon.textContent = '📄';
+          chip.title = '点击在文件夹中定位';
+        }
+
+        chip.appendChild(icon);
+        chip.appendChild(name);
+
+        // Markdown 文件使用专属样式和 icon
+        if (kind === 'markdown') {
+          chip.classList.add('path-markdown');
+          icon.textContent = '📝';
+          chip.title = '点击用 Markdown 查看器打开';
+        }
+
+        // 绑定点击事件
+        chip.addEventListener('click', (e) => {
+          e.stopPropagation();
+          handlePathChipClick(path);
+        });
+
+        return chip;
+      }
+
+      /**
+       * 处理路径 chip 点击：Tauri 在文件管理器中定位，Web 复制路径。
+       *
+       * 文件与目录都直接 reveal 目标本身（在其父目录中被选中）。不再手工截父目录——
+       * 那个写法在根目录、结尾带分隔符时会算出空串。
+       */
+      async function handlePathChipClick(path) {
+        // Markdown 文件快速打开：直接跳查看器
+        try {
+          if (openMarkdownFile(path)) return;
+        } catch (err) {
+          console.error('打开 Markdown 失败:', err);
+          toast('打开 Markdown 失败：' + (err?.message || err));
+        }
+
+        // 后续原有逻辑（Tauri 定位 / Web 复制）
+        if (!window.tauriApi?.revealPath) {
+          // Web 模式：复制路径
+          try {
+            await navigator.clipboard.writeText(path);
+            toast('已复制路径：' + path);
+          } catch {
+            toast('复制失败');
+          }
+          return;
+        }
+
+        try {
+          await window.tauriApi.revealPath(path);
+        } catch (err) {
+          console.error('revealPath failed:', err);
+          // Tauri 命令 reject 回传的是**序列化后的字符串**（插件 Error 的 Serialize
+          // 走 serialize_str），对字符串取 .message 恒为 undefined——原先写 err?.message
+          // 把 scope 校验失败的真实原因吞成了「未知错误」，正是本 bug 难查的直接原因。
+          const msg = typeof err === 'string' ? err : (err?.message ?? JSON.stringify(err));
+          toast('打开失败：' + msg);
+        }
+      }
+
+      /**
+       * 判断路径类型：image / file / dir。
+       *
+       * 原先走 invoke('plugin:shell|path_exists' / 'path_kind')，但这两个命令在
+       * src-tauri 里根本不存在（shell 插件也没提供），每次必然抛错走 catch 降级，
+       * 结果 'image' 分支永远走不到——缩略图和灯箱从上线起就没生效过。
+       * 与其留着一个假的异步校验，不如直接按扩展名判断，行为可预期。
+       *
+       * 存在性不在这里管：图片交给 img.onerror 兜底（见 makeImageElement），
+       * 那才是真正能验证文件读不读得到的地方。
+       */
+      function classifyPath(path) {
+        if (isImagePath(path)) return 'image';
+        if (isMarkdownPath(path)) return 'markdown';
+        // 只看最后一段，且要求扩展名前有字符——否则 C:\Users\DELL\.uploads
+        // 这种点开头的目录会被当成文件
+        return /[^.\\/]\.[A-Za-z0-9]{1,8}$/.test(getPathName(path)) ? 'file' : 'dir';
+      }
+
+      /**
+       * 主函数：扫描文本中的路径，转换为 DOM 节点混合内容
+       */
+      async function renderPathsInText(text, container) {
+        if (!text || !container) return;
+
+        // 收集所有路径及其位置
+        const matches = [];
+        for (const pattern of PATH_PATTERNS) {
+          pattern.lastIndex = 0;
+          let m;
+          while ((m = pattern.exec(text)) !== null) {
+            // m[1] 是前置边界（空白/引号/行首），不属于路径本身，要跳过它算起点
+            const start = m.index + (m[1] || '').length;
+            const path = stripTrailingPunct(cutAtExtension(m[2]));
+            if (!isAbsolutePath(path)) continue;
+            matches.push({ path, start, end: start + path.length });
+          }
+          pattern.lastIndex = 0;
+        }
+
+        // 按起点排序（同起点取更长的），再丢弃相互重叠的区间。
+        // 重叠是真实存在的：C:/a/b 会同时命中 Windows 和 Unix 两条规则，
+        // 不去重会把同一段文本渲染两次。
+        const uniqueMatches = [];
+        let cursor = 0;
+        for (const m of matches.sort((a, b) => a.start - b.start || b.end - a.end)) {
+          if (m.start < cursor) continue;
+          uniqueMatches.push(m);
+          cursor = m.end;
+        }
+
+        // 如果没找到路径，直接返回文本
+        if (!uniqueMatches.length) {
+          container.textContent = text;
+          return;
+        }
+
+        // 构建 DOM：交替组合文本和路径节点
+        const fragment = document.createDocumentFragment();
+        let lastEnd = 0;
+
+        for (const match of uniqueMatches) {
+          // 添加路径前的文本
+          if (match.start > lastEnd) {
+            fragment.appendChild(
+              document.createTextNode(text.slice(lastEnd, match.start))
+            );
+          }
+
+          const kind = classifyPath(match.path);
+          // 浏览器里没有 convertFileSrc，本地图片根本加载不了，
+          // 与其挂个破图不如老老实实退回 chip（点击复制路径）
+          const imgSrc = kind === 'image' ? toWebviewUrl(match.path) : null;
+
+          if (imgSrc) {
+            // 图片：缩略图 + 灯箱
+            const img = makeImageElement(match.path, imgSrc);
+            img.addEventListener('click', (e) => {
+              e.stopPropagation();
+              showLightbox(match.path);
+            });
+            fragment.appendChild(img);
+          } else if (kind === 'dir') {
+            // 目录
+            fragment.appendChild(makePathChip(match.path, 'dir'));
+          } else if (kind === 'markdown') {
+            // Markdown 文件
+            fragment.appendChild(makePathChip(match.path, 'markdown'));
+          } else {
+            // 文件（默认）
+            fragment.appendChild(makePathChip(match.path, 'file'));
+          }
+
+          lastEnd = match.end;
+        }
+
+        // 添加剩余文本
+        if (lastEnd < text.length) {
+          fragment.appendChild(document.createTextNode(text.slice(lastEnd)));
+        }
+
+        container.innerHTML = '';
+        container.appendChild(fragment);
+      }
+
+      // ---- 灯箱缩放与拖拽状态管理 ----
+      /**
+       * 灯箱初始状态常量
+       * @property {number} scale - 当前缩放倍数（1.0 = 100%，范围 0.5~5）
+       * @property {number} translateX - X 轴偏移，单位像素
+       * @property {number} translateY - Y 轴偏移，单位像素
+       * @property {boolean} isDragging - 是否正在进行拖拽操作
+       * @property {number} dragStartX - 拖拽开始时的鼠标 X 坐标（视口坐标）
+       * @property {number} dragStartY - 拖拽开始时的鼠标 Y 坐标（视口坐标）
+       */
+      const INITIAL_LIGHTBOX_STATE = {
+        scale: 1,
+        translateX: 0,
+        translateY: 0,
+        isDragging: false,
+        dragStartX: 0,
+        dragStartY: 0,
+      };
+
+      /**
+       * 灯箱状态对象，管理图片的缩放和拖拽
+       * @property {number} scale - 当前缩放倍数（1.0 = 100%，范围 0.5~5）
+       * @property {number} translateX - X 轴偏移，单位像素
+       * @property {number} translateY - Y 轴偏移，单位像素
+       * @property {boolean} isDragging - 是否正在进行拖拽操作
+       * @property {number} dragStartX - 拖拽开始时的鼠标 X 坐标（视口坐标）
+       * @property {number} dragStartY - 拖拽开始时的鼠标 Y 坐标（视口坐标）
+       */
+      let lightboxState = { ...INITIAL_LIGHTBOX_STATE };
+
+      /**
+       * 将数值约束在指定范围内（inclusive）
+       * @param {number} value - 待约束的值
+       * @param {number} min - 最小值（应 <= max）
+       * @param {number} max - 最大值（应 >= min）
+       * @returns {number} 约束后的值
+       */
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      // 应用当前 transform 到图片元素
+      function updateLightboxTransform() {
+        const lightbox = document.getElementById('imgLightbox');
+        const img = lightbox?.querySelector('.lightbox-img');
+        if (!img) return;
+
+        const { scale, translateX, translateY } = lightboxState;
+        img.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;
+      }
+
+      // 重置灯箱状态
+      function resetLightboxState() {
+        Object.assign(lightboxState, INITIAL_LIGHTBOX_STATE);
+      }
+
+      /**
+       * 显示图片灯箱
+       */
+      function showLightbox(imagePath) {
+        // 提前验证参数和 URL 转换
+        const src = toWebviewUrl(imagePath);
+        if (!src) return; // 提前返回，不修改状态
+
+        const lightbox = document.getElementById('imgLightbox');
+        const img = lightbox?.querySelector('.lightbox-img');
+        if (!img) return;
+
+        // 此时才修改状态（确保 URL 有效）
+        resetLightboxState();
+        updateLightboxTransform();
+
+        img.src = src;
+        img.classList.remove('zoomed', 'dragging');
+        lightbox.hidden = false;
+      }
+
+      /**
+       * 关闭灯箱
+       */
+      function closeLightbox() {
+        const lightbox = document.getElementById('imgLightbox');
+        if (!lightbox) return;
+
+        resetLightboxState();
+
+        // 清除 transform 和样式
+        const img = lightbox.querySelector('.lightbox-img');
+        if (img) {
+          img.style.transform = '';
+          img.classList.remove('zoomed', 'dragging');
+        }
+
+        lightbox.hidden = true;
+      }
+
+      // 处理图片按下（开始拖拽）
+      function handleLightboxMouseDown(event) {
+        if (lightboxState.scale <= 1) return; // 仅在放大时允许拖拽
+
+        lightboxState.dragStartX = event.clientX;
+        lightboxState.dragStartY = event.clientY;
+        lightboxState.isDragging = false; // 等待移动超过阈值
+
+        // 绑定全局 mousemove 和 mouseup
+        document.addEventListener('mousemove', handleLightboxMouseMove);
+        document.addEventListener('mouseup', handleLightboxMouseUp);
+      }
+
+      // 处理鼠标移动（拖拽中）
+      function handleLightboxMouseMove(event) {
+        const lightbox = document.getElementById('imgLightbox');
+        const img = lightbox?.querySelector('.lightbox-img');
+        const overlay = lightbox?.querySelector('.lightbox-overlay');
+        if (!img || !overlay) return;
+
+        const dx = event.clientX - lightboxState.dragStartX;
+        const dy = event.clientY - lightboxState.dragStartY;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+
+        // 距离超过 3px 才确认拖拽
+        if (!lightboxState.isDragging && distance > 3) {
+          lightboxState.isDragging = true;
+          img.classList.add('dragging');
+        }
+
+        if (lightboxState.isDragging) {
+          // 更新位移
+          lightboxState.translateX += dx;
+          lightboxState.translateY += dy;
+
+          // 应用边界约束
+          applyDragBoundary(img, overlay);
+
+          // 应用 transform
+          updateLightboxTransform();
+
+          // 更新起始点（持续拖拽时）
+          lightboxState.dragStartX = event.clientX;
+          lightboxState.dragStartY = event.clientY;
+        }
+      }
+
+      // 处理鼠标抬起（拖拽结束）
+      function handleLightboxMouseUp(event) {
+        const lightbox = document.getElementById('imgLightbox');
+        const img = lightbox?.querySelector('.lightbox-img');
+
+        if (img && lightboxState.isDragging) {
+          img.classList.remove('dragging');
+        }
+
+        lightboxState.isDragging = false;
+
+        // 清理全局事件监听
+        document.removeEventListener('mousemove', handleLightboxMouseMove);
+        document.removeEventListener('mouseup', handleLightboxMouseUp);
+      }
+
+      // 应用拖拽边界约束
+      function applyDragBoundary(img, overlay) {
+        if (!img || !overlay) return;
+
+        const { scale, translateX, translateY } = lightboxState;
+        const imgRect = img.getBoundingClientRect();
+        const overlayRect = overlay.getBoundingClientRect();
+
+        // 获取图片的原始尺寸
+        const imgWidth = img.naturalWidth || img.offsetWidth;
+        const imgHeight = img.naturalHeight || img.offsetHeight;
+
+        // 视窗尺寸（px，转换自 vw/vh）
+        const viewportWidth = overlayRect.width;
+        const viewportHeight = overlayRect.height;
+
+        // 计算最大拖拽距离
+        const maxTranslateX = (imgWidth * scale - viewportWidth) / 2;
+        const maxTranslateY = (imgHeight * scale - viewportHeight) / 2;
+
+        // 约束
+        lightboxState.translateX = clamp(translateX, -maxTranslateX, maxTranslateX);
+        lightboxState.translateY = clamp(translateY, -maxTranslateY, maxTranslateY);
+      }
+
+      // 处理滚轮缩放
+      function handleLightboxWheel(event) {
+        event.preventDefault();
+
+        const lightbox = document.getElementById('imgLightbox');
+        const img = lightbox?.querySelector('.lightbox-img');
+        const overlay = lightbox?.querySelector('.lightbox-overlay');
+        if (!img || !overlay) return;
+
+        // 获取鼠标在 overlay 中的位置
+        const rect = overlay.getBoundingClientRect();
+        const mouseX = event.clientX - rect.left;
+        const mouseY = event.clientY - rect.top;
+
+        // 判断滚轮方向
+        const isScrollUp = event.deltaY < 0;
+        const scaleFactor = isScrollUp ? 1.1 : 1 / 1.1;
+
+        // 计算新缩放
+        const oldScale = lightboxState.scale;
+        const newScale = clamp(oldScale * scaleFactor, 0.5, 5);
+
+        // 调试日志：验证 scale 计算（Task 3 后可移除）
+        console.log(`[wheel] oldScale=${oldScale}, scaleFactor=${scaleFactor.toFixed(2)}, newScale=${newScale.toFixed(2)}`);
+
+        if (newScale === oldScale) {
+          console.log('[wheel] 已到达缩放极限，不处理');
+          return; // 已到达极限，不处理
+        }
+
+        // 保持鼠标指向处的图片像素不动
+        // transform-origin:center → 缩放基准是 overlay 中心，坐标系须以中心为原点
+        const ratio = newScale / oldScale;
+        const relX = mouseX - rect.width / 2;
+        const relY = mouseY - rect.height / 2;
+        lightboxState.translateX = lightboxState.translateX * ratio + relX * (1 - ratio);
+        lightboxState.translateY = lightboxState.translateY * ratio + relY * (1 - ratio);
+
+        // 更新缩放
+        lightboxState.scale = newScale;
+
+        // 应用 transform
+        updateLightboxTransform();
+
+        // 更新样式反馈
+        if (newScale > 1) {
+          img.classList.add('zoomed');
+        } else {
+          img.classList.remove('zoomed');
+        }
+      }
+
+      // 灯箱事件：点击背景关闭、Esc 关闭、关闭按钮
+      document.addEventListener('DOMContentLoaded', () => {
+        const lightbox = document.getElementById('imgLightbox');
+        const overlay = lightbox?.querySelector('.lightbox-overlay');
+        const closeBtn = lightbox?.querySelector('.lightbox-close');
+        const img = lightbox?.querySelector('.lightbox-img');
+
+        if (lightbox) {
+          // 点击蒙层（背景）关闭，但点击图片或拖拽中时不关闭
+          lightbox.addEventListener('click', (e) => {
+            // 只在点击图片内部时不关闭
+            if (e.target.closest('.lightbox-img')) return;
+            // 正在拖拽 → 不关闭
+            if (lightboxState.isDragging) return;
+            // 其他所有情况关闭（包括点击 overlay 背景和蒙层外的黑色区域）
+            closeLightbox();
+          });
+
+          // 滚轮缩放事件
+          overlay?.addEventListener('wheel', handleLightboxWheel, { passive: false });
+
+          // 关闭按钮
+          closeBtn?.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closeLightbox();
+          });
+
+          // 图片拖拽事件
+          img?.addEventListener('mousedown', handleLightboxMouseDown);
+        }
+
+        // Esc 关闭
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape') closeLightbox();
+        });
+      });
+
+      // ---- 消息渲染 ----
+      async function addMessage(role, text, meta) {
+        emptyEl.style.display = 'none';
+        const msg = document.createElement('div');
+        msg.className = 'msg ' + role;
+        const who = document.createElement('div');
+        who.className = 'who';
+        who.textContent = role === 'user' ? '你' : '◆ ' + (
+          chatProvider === 'openai-compat'
+            ? (chatCustomLabel || chatCustomModel || '自定义模型')
+            : (chatActiveTokenLabel || 'Claude')
+        );
+        // 添加复制按钮
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'copy-btn';
+        copyBtn.title = '复制文本';
+        copyBtn.innerHTML = '<svg class="copy-icon" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M938.666667 256h-170.666667V85.333333c0-25.6-17.066667-42.666667-42.666667-42.666666H85.333333c-21.333333 0-42.666667 21.333333-42.666666 42.666666v640c0 25.6 17.066667 42.666667 42.666666 42.666667h170.666667v170.666667c0 25.6 17.066667 42.666667 42.666667 42.666666h640c25.6 0 42.666667-17.066667 42.666666-42.666666V298.666667c0-21.333333-17.066667-42.666667-42.666666-42.666667zM128 682.666667V128h554.666667v128H298.666667c-21.333333 0-42.666667 21.333333-42.666667 42.666667v384H128z m768 213.333333H341.333333V341.333333h554.666667v554.666667z" fill="currentColor"></path></svg>';
+        copyBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          copyMessageText(msg, text);
+        });
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        if (role === 'assistant') renderMarkdown(bubble, text);
+        else {
+          // 用户消息：扫描路径并转为可交互样式
+          await renderPathsInText(text, bubble);
+        }
+        // 气泡行：把复制按钮放到气泡侧边（Claude 右侧 / 用户左侧）
+        const bubbleRow = document.createElement('div');
+        bubbleRow.className = 'bubble-row';
+        if (role === 'user') {
+          bubbleRow.appendChild(copyBtn);
+          bubbleRow.appendChild(bubble);
+        } else {
+          bubbleRow.appendChild(bubble);
+          bubbleRow.appendChild(copyBtn);
+        }
+        msg.appendChild(who);
+        msg.appendChild(bubbleRow);
+        messagesEl.appendChild(msg);
+        scrollBottom();
+        // 写入气泡缓存（仅当前会话）
+        if (currentConvId) bubblePush(currentConvId, bubble); // 与存储 push 同步登记，保持索引对齐
+
+        // ---- DOM 上限控制：超过 MAX_DOM_MESSAGES 时**折叠**最早的气泡（不是移除）----
+        // 为什么不能 remove：
+        //  ① 省不到内存 —— _bubbleMap 仍持有这些元素的引用，remove 只是把它们从「挂在 DOM 上」
+        //     变成「detached 常驻」，泄漏照旧；
+        //  ② 破坏「存储索引 = DOM 索引 = _bubbleMap 索引」这条全模块依赖的不变量 ——
+        //     splitSegment 与 bubbleAt 的降级路径都用 querySelectorAll('.msg')[index] 定位，
+        //     裁掉前 N 个之后索引整体错位，后续流式输出会画到错误的气泡上。
+        //     原注释承诺的「由 bubbleGet 调用方容错」并不存在，`|| null` 只是不报错而已。
+        // 折叠 = 保留节点占位（索引不动）+ 丢掉渲染出来的重子树（真正释放内存）。
+        const msgElements = messagesEl.querySelectorAll('.msg:not(.collapsed)');
+        if (msgElements.length > MAX_DOM_MESSAGES) {
+          const excess = msgElements.length - MAX_DOM_MESSAGES;
+          for (let i = 0; i < excess; i++) collapseBubble(msgElements[i]);
+        }
+
+        if (meta && meta.msgId) msg.dataset.msgId = meta.msgId;
+        return msg;
+      }
+
+      // ---- 排队卡片条（queue-first）：对账 / 渲染 / 投递上屏 / 卡片动作 ----
+
+      /** 该 conv 的持久化卡片（conv.meta.queue，{id,text,at}）——服务端清单可达前的兜底镜像 */
+      function loadConvQueue(convId) {
+        const c = loadConvs().find((x) => x.id === convId);
+        return Array.isArray(c?.meta?.queue) ? c.meta.queue.filter((m) => m && m.id) : [];
+      }
+      function saveConvQueue(convId, items) {
+        convSetMeta(convId, { queue: items.map((m) => ({ id: m.id, text: m.text, at: m.at || 0 })) });
+      }
+
+      /** 服务端清单对账：merge → 持久化 → 已投递项上屏 → 渲染（仅当前会话）。
+       *  并发合并（Inflight/Dirty）：SSE 事件常成串到达——在途时只记脏、结束后补跑一次。 */
+      async function syncQueue(convId) {
+        if (!convId) return;
+        if (queueSyncInflight[convId]) {
+          queueSyncDirty[convId] = true;
+          return;
+        }
+        queueSyncInflight[convId] = true;
+        const fetchStartedAt = Date.now();
+        try {
+          let data;
+          try {
+            data = await (await fetch('/api/run/queue?convId=' + encodeURIComponent(convId))).json();
+          } catch {
+            return; // 网络失败：保留本地镜像，等下一次对账
+          }
+          if (!data || !Array.isArray(data.items)) return;
+          queueRunIds[convId] = data.runId || null;
+          const local = convQueues[convId] || loadConvQueue(convId);
+          // 本地有、服务端无 = 已投递（消费/排空/离线期间完成）→ 上屏。判定规则见 logic 注释。
+          const { items, delivered } = mergeQueue(local, data.items, { fetchStartedAt });
+          convQueues[convId] = items;
+          saveConvQueue(convId, items);
+          // 已投递但本地还没上屏（关页/断连期间完成投递）→ 补上屏；正在跑的话同 consumed 语义切段
+          for (const item of delivered) {
+            await deliverQueueItem(convId, item, { split: !!runningJobs[convId] });
+          }
+          if (convId === currentConvId) renderQueueStrip();
+        } finally {
+          queueSyncInflight[convId] = false;
+          if (queueSyncDirty[convId]) {
+            queueSyncDirty[convId] = false;
+            syncQueue(convId);
+          }
+        }
+      }
+
+      /** 渲染当前会话的卡片条（无当前会话/空列表 → 隐藏） */
+      function renderQueueStrip() {
+        if (!currentConvId) {
+          queueStrip.render([]);
+          return;
+        }
+        const items = convQueues[currentConvId] || loadConvQueue(currentConvId);
+        queueStrip.render(items, { pendingId: queuePending[currentConvId] || null });
+      }
+
+      function addQueueItem(convId, item) {
+        const list = (convQueues[convId] || loadConvQueue(convId)).filter((m) => m.id !== item.id);
+        list.push({ id: item.id, text: item.text || '', at: item.at || Date.now() });
+        convQueues[convId] = list;
+        saveConvQueue(convId, list);
+        if (convId === currentConvId) renderQueueStrip();
+      }
+      function removeQueueItem(convId, id) {
+        const list = (convQueues[convId] || loadConvQueue(convId)).filter((m) => m.id !== id);
+        convQueues[convId] = list;
+        saveConvQueue(convId, list);
+        if (convId === currentConvId) renderQueueStrip();
+      }
+
+      /** 把一条已投递的排队消息作为普通用户消息上屏（幂等：按消息 msgId 戳去重）。
+       *  opts.split：连切段一起做（steer-now 消费场景——新助手占位要排到该消息之后）。 */
+      async function deliverQueueItem(convId, item, opts = {}) {
+        if (!item || !item.id) return;
+        const conv = loadConvs().find((x) => x.id === convId);
+        if (!conv || conv.messages.some((m) => m.msgId === item.id)) return; // 会话已删/已上过屏
+        const text = typeof item.text === 'string' ? item.text : '';
+        const idx = convPushMessage(convId, 'user', text);
+        if (idx < 0) return;
+        convSetMsgFields(convId, idx, { msgId: item.id });
+        if (!conv.title && text) convSetTitle(convId, text.slice(0, 30)); // 首条消息即排队时补标题
+        if (convId === currentConvId) {
+          const el = await addMessage('user', text);
+          if (el) el.dataset.msgId = item.id;
+        }
+        // 切段在后台会话也做（splitSegment 内部按可见性只动存储侧）
+        if (opts.split && runningJobs[convId]) splitSegment(runningJobs[convId]);
+        renderConvListDebounced();
+      }
+
+      /** consumed 事件（steer-now / 步边界消费）：命中卡片 → 上屏并移除卡片；顺带清遗留排队态 */
+      async function handleQueueConsumed(convId, ids, job) {
+        if (!Array.isArray(ids) || !ids.length) return;
+        const items = convQueues[convId] || loadConvQueue(convId);
+        for (const item of items.filter((m) => ids.includes(m.id))) {
+          await deliverQueueItem(convId, item);
+          removeQueueItem(convId, item.id);
+        }
+        const conv = loadConvs().find((x) => x.id === convId);
+        // 切段（与旧 consumed 语义一致）：定稿当前助手气泡 + 新占位接后续输出；
+        // 会话已删则不切（避免产生 asstIndex 越界的脏状态）
+        if (conv && job) splitSegment(job);
+        // 遗留（老版本 localStorage）排队气泡的字段清理：现在按普通消息渲染
+        if (conv) {
+          conv.messages.forEach((m, i) => {
+            if (m.queued && ids.includes(m.msgId)) convSetMsgFields(convId, i, { queued: false, unsent: false });
+          });
+        }
+        syncQueue(convId); // 兜底对账（fire-and-forget）
+      }
+
+      /** 卡片「立即发送」：把排队项 steer 进正在运行的任务（服务端转换成持有消息并立即投递）。 */
+      async function steerQueuedMsg(msgId) {
+        const convId = currentConvId;
+        if (!convId || queuePending[convId]) return;
+        const job = runningJobs[convId];
+        const runId = (job && job.runId) || queueRunIds[convId];
+        if (!runId) return toast('任务未在运行：消息会在当前任务结束后自动发送');
+        queuePending[convId] = msgId;
+        renderQueueStrip();
+        let d = null;
+        try {
+          d = await (
+            await fetch('/api/run/msg/now', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ runId, msgId }),
+            })
+          ).json();
+        } catch {
+          d = null;
+        }
+        delete queuePending[convId];
+        if (!d || !d.ok) {
+          if (d && d.code === 'not_ready') toast('任务正在启动，稍后再试');
+          else if (d && d.code === 'gone') toast('这条消息已进入任务，请稍候');
+          else toast('暂时无法立即发送，消息会等当前任务结束后自动发送');
+          await syncQueue(convId);
+          return;
+        }
+        await syncQueue(convId); // 服务端已转入持有区（卡片转为「发送中…」）
+      }
+
+      /** 卡片「✕」：撤回排队项（不影响正在运行的任务）。 */
+      async function withdrawQueuedMsg(msgId) {
+        const convId = currentConvId;
+        if (!convId || queuePending[convId]) return;
+        const job = runningJobs[convId];
+        const runId = (job && job.runId) || queueRunIds[convId];
+        if (!runId) return toast('任务未在运行，消息会随下一轮自动开始');
+        queuePending[convId] = msgId;
+        renderQueueStrip();
+        let d = null;
+        try {
+          d = await (
+            await fetch('/api/run/msg/withdraw', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ runId, msgId }),
+            })
+          ).json();
+        } catch {
+          d = null;
+        }
+        delete queuePending[convId];
+        if (!d || !d.ok) {
+          toast('消息已进入任务，无法撤回');
+          await syncQueue(convId);
+          return;
+        }
+        removeQueueItem(convId, msgId);
+      }
+
+      // 复制消息文本
+      function copyMessageText(msgEl, text) {
+        const bubble = msgEl.querySelector('.bubble');
+        let copyText = text;
+        // Claude 消息：取正文纯文本（定稿气泡整体是 md；流式中正文在 .md-body 容器）
+        const mdEl =
+          bubble && (bubble.classList.contains('md') ? bubble : bubble.querySelector('.md-body'));
+        if (mdEl) copyText = mdEl.innerText || text;
+        navigator.clipboard.writeText(copyText).then(() => {
+          const copyBtn = msgEl.querySelector('.copy-btn');
+          const originalHtml = copyBtn.innerHTML;
+          copyBtn.innerHTML = '✓';
+          copyBtn.classList.add('copied');
+          setTimeout(() => {
+            copyBtn.innerHTML = originalHtml;
+            copyBtn.classList.remove('copied');
+          }, 1500);
+        }).catch(() => {
+          toast('复制失败');
+        });
+      }
+      function scrollBottom() {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      // 仅当用户已在底部附近时才自动吸底，避免打断向上翻阅
+      function nearBottom() {
+        return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+      }
+
+      // ---- 打字机 + 运行状态（spinner / 工具活动）----
+      // 运行状态行的模型短名：Claude 家族按关键字映射成短名；自定义模型（openai-compat）显示
+      // 所选模型的展示名。原实现把所有非 Fable/Opus/Haiku 的 id 一律兜底成 'Sonnet'，
+      // 导致自定义模型（如 DeepSeek）被显示成「Sonnet · 生成中…」。
+      function shortModel(m, e) {
+        const id = String(m || '');
+        let name;
+        if (chatProvider === 'openai-compat' && id === chatCustomModel) {
+          name = chatCustomLabel || chatCustomModel; // 与输入栏 chip / 气泡署名同一显示名
+        } else {
+          name = /fable/.test(id) ? 'Fable' : /opus/.test(id) ? 'Opus' : /haiku/.test(id) ? 'Haiku' : /sonnet/.test(id) ? 'Sonnet' : id;
+        }
+        return e ? name + '·' + e : name;
+      }
+      function jobStatusText(job) {
+        const tag = job.pickLabel ? job.pickLabel + ' · ' : ''; // 所选/自动判定的模型
+        if (job.text.length > job.base) return tag + '生成中…'; // 本段已有产出
+        return tag + '运行中…'; // 刚启动 / 等待首个 token / 调工具中
+      }
+      // 工具活动转录（仅展示最新1条，带 clone 过渡动画）
+      function renderToolLog(activities) {
+        const box = document.createElement('div');
+        box.className = 'tool-log tool-log-single';
+        if (!activities || !activities.length) return box;
+        const latest = activities[activities.length - 1];
+        // 动画由 AnimeAnimations.animateToolLine 接管，box 作为容器传入
+        // 此处先填充内容（paintJob 结束后 animateToolLine 会被调用）
+        const dot = document.createElement('span');
+        dot.className = 'tool-dot';
+        const txt = document.createElement('span');
+        txt.className = 'tool-text-anim';
+        txt.textContent = latest;
+        box.appendChild(dot);
+        box.appendChild(txt);
+        box._latestText = latest; // 暂存最新文字，供 paintJob 中使用
+        return box;
+      }
+      // 任务清单面板（TodoWrite 快照）
+      function renderTodoPanel(todos) {
+        const box = document.createElement('div');
+        box.className = 'todo-panel';
+        const head = document.createElement('div');
+        head.className = 'todo-head';
+        const done = todos.filter((t) => t.status === 'completed').length;
+        head.textContent = `任务清单 · ${done}/${todos.length}`;
+        box.appendChild(head);
+        for (const t of todos) {
+          const st =
+            t.status === 'completed' ? 'done' : t.status === 'in_progress' ? 'doing' : 'todo';
+          const mk = st === 'done' ? '✓' : st === 'doing' ? '▸' : '▫';
+          const item = document.createElement('div');
+          item.className = 'todo-item ' + st;
+          const mkEl = document.createElement('span');
+          mkEl.className = 'mk';
+          mkEl.textContent = mk;
+          const tx = document.createElement('span');
+          tx.className = 'tx';
+          tx.textContent = (st === 'doing' && t.activeForm ? t.activeForm : t.content) || '';
+          item.append(mkEl, tx);
+          box.appendChild(item);
+        }
+        return box;
+      }
+      // 把某 job 的当前进度画到可见气泡：markdown(已显示文本) + 工具转录 + 任务清单 + 运行状态。
+      // 正文放独立 .md-body 容器每帧重渲染；工具行/状态行等附属 UI 跨帧复用，
+      // 避免整泡 innerHTML 重建把动画状态（工具行过渡/spinner/状态文字）一并打断
+      function paintJob(job) {
+        if (!job || job.convId !== currentConvId) return;
+        const vb = bubbleAt(job.asstIndex);
+        if (!vb) return;
+        let md = vb.querySelector('.md-body');
+        if (!md) {
+          vb.textContent = '';
+          md = document.createElement('div');
+          md.className = 'md-body';
+          vb.appendChild(md);
+        }
+        renderMarkdown(md, job.text.slice(job.base, job.shown));
+        // 固定顺序：正文 → 工具行 → 任务清单 → 状态行/提问卡片（插入位置按锚点，元素不迁移）
+        if (job.activities && job.activities.length) {
+          const latest = job.activities[job.activities.length - 1];
+          let toolBox = vb.querySelector('.tool-log-single');
+          if (!toolBox) {
+            toolBox = renderToolLog(job.activities);
+            md.after(toolBox); // 首次插入，无需动画
+          } else if (toolBox._latestText !== latest) {
+            // 复用容器，仅在内容变化时触发过渡动画
+            AnimeAnimations.animateToolLine(toolBox, latest);
+            toolBox._latestText = latest;
+          }
+        }
+        // 任务清单面板是 job.todos 的投影：有清单才画，清单被清空（TodoWrite 传空数组）时必须撤下——
+        // 只处理非空分支的话，旧面板会留在气泡里直到本轮结束/切会话整体重绘，看着像「清单没被清掉」。
+        if (job.todos && job.todos.length) {
+          const panel = renderTodoPanel(job.todos);
+          const old = vb.querySelector('.todo-panel');
+          if (old) old.replaceWith(panel);
+          else (vb.querySelector('.tool-log-single') || md).after(panel);
+        } else {
+          const stale = vb.querySelector('.todo-panel');
+          if (stale) stale.remove();
+        }
+        // 非阻塞提示卡（「问同事」问题+选项）：可多张并存，独立于阻塞审批卡，
+        // 用独立 class（.ask-notice-card）以免被下面 querySelector('.ask-card') 误抓。
+        const oldNotices = vb.querySelector('.ask-notices');
+        if (oldNotices) oldNotices.remove();
+        const noticeList = Object.values(job.notices || {});
+        if (noticeList.length) {
+          const box = document.createElement('div');
+          box.className = 'ask-notices';
+          for (const n of noticeList) box.appendChild(renderAskNoticeCard(job, n));
+          (vb.querySelector('.tool-log-single') || md).after(box);
+        }
+        const oldAsk = vb.querySelector('.ask-card');
+        if (job.ask) {
+          const st = vb.querySelector('.run-status');
+          if (st) st.remove(); // 等待用户决策：状态行让位给选项卡片
+          if (!oldAsk || oldAsk._reqId !== job.ask.reqId) {
+            if (oldAsk) oldAsk.remove();
+            const card = renderAskCard(job);
+            card._reqId = job.ask.reqId;
+            vb.appendChild(card);
+            // 更新吉祥物为问询状态
+            if (currentConvId === job.convId) AnimeAnimations.setMascotState('asking');
+          }
+        } else {
+          if (oldAsk) oldAsk.remove();
+          let st = vb.querySelector('.run-status');
+          if (!st) {
+            st = document.createElement('div');
+            st.className = 'run-status';
+            st.innerHTML = '<span class="spinner"></span><span class="run-text"></span>';
+            vb.appendChild(st);
+          }
+          const runTextEl = st.querySelector('.run-text');
+          const newStatusText = jobStatusText(job);
+          AnimeAnimations.animateStatusText(runTextEl, newStatusText);
+          // 恢复默认状态（如果已清除 ask）
+          if (currentConvId === job.convId) AnimeAnimations.setMascotState('');
+        }
+        if (nearBottom()) scrollBottom();
+      }
+      // 交互审批/提问卡片（图2 风格）
+      function renderAskCard(job) {
+        const ask = job.ask;
+        const card = document.createElement('div');
+        card.className = 'ask-card';
+        const title = document.createElement('div');
+        title.className = 'ask-title';
+        title.textContent = ask.title || '需要你的确认';
+        card.appendChild(title);
+        if (ask.body) {
+          const body = document.createElement('div');
+          body.className = 'ask-body';
+          body.textContent = ask.body;
+          card.appendChild(body);
+        }
+        const opts = document.createElement('div');
+        opts.className = 'ask-opts';
+        for (const o of ask.options || []) {
+          const b = document.createElement('button');
+          b.className = 'ask-opt';
+          const lab = document.createElement('span');
+          lab.className = 'opt-label';
+          lab.textContent = o.label || o.id;
+          b.appendChild(lab);
+          if (o.desc) {
+            const d = document.createElement('span');
+            d.className = 'opt-desc';
+            d.textContent = o.desc;
+            b.appendChild(d);
+          }
+          b.onclick = () => submitDecision(job, ask.reqId, o.id);
+          opts.appendChild(b);
+        }
+        card.appendChild(opts);
+        return card;
+      }
+      // 非阻塞提示卡（「问同事」）：问题 + 可点选项。点选项 = 开发者在执行台拍板 →
+      // 服务端立即结算委托并通知同事，同时推 notice-dismiss 收卡（这里先乐观撤下防重复点击）。
+      function renderAskNoticeCard(job, notice) {
+        const card = document.createElement('div');
+        card.className = 'ask-notice-card';
+        const title = document.createElement('div');
+        title.className = 'ask-title';
+        title.textContent = notice.title || '提示';
+        card.appendChild(title);
+        if (notice.body) {
+          const body = document.createElement('div');
+          body.className = 'ask-body';
+          body.textContent = notice.body;
+          card.appendChild(body);
+        }
+        const opts = document.createElement('div');
+        opts.className = 'ask-opts';
+        for (const o of notice.options || []) {
+          const b = document.createElement('button');
+          b.className = 'ask-opt';
+          const lab = document.createElement('span');
+          lab.className = 'opt-label';
+          lab.textContent = o; // 选项是纯字符串（与审批卡的 {id,label} 不同）
+          b.appendChild(lab);
+          b.onclick = () => submitFeishuAskConfirm(job, notice.id, o);
+          opts.appendChild(b);
+        }
+        card.appendChild(opts);
+        return card;
+      }
+      // 主机在 web 卡上点选项 → 结算委托 + 通知同事
+      function submitFeishuAskConfirm(job, questionId, option) {
+        fetch('/api/req/feishu-ask/confirm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ questionId, option }),
+        }).catch(() => {});
+        if (job.notices) delete job.notices[questionId]; // 乐观收卡
+        job.rev++;
+        if (job.convId === currentConvId) {
+          job._paintedRev = -1;
+          paintJob(job);
+        }
+      }
+      // 提交交互决策 → 服务端 resolve 续跑
+      function submitDecision(job, reqId, optionId) {
+        fetch('/api/run/decision', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId: job.runId, reqId, optionId }),
+        }).catch(() => {});
+        job.ask = null; // 乐观清除，等待后续事件续流
+        job.rev++;
+        if (job.convId === currentConvId) {
+          job._paintedRev = -1;
+          paintJob(job);
+        }
+        refreshAskChip();
+      }
+      /** 刷新顶栏审批徽标：仅当离开聊天视图且存在挂起审批时显示「⏳ N 待确认」
+       *  触发点：ask/replay 事件回调、showView 切换视图（由壳经导出调用）、job 结束 */
+      export function refreshAskChip() {
+        const chip = $('#askChip');
+        if (!chip) return;
+        let askCount = 0;
+        for (const job of Object.values(runningJobs)) {
+          if (job && job.ask) askCount++;
+        }
+        const shouldShow = !_isChatViewActive() && askCount > 0;
+        chip.hidden = !shouldShow;
+        if (shouldShow) setIconText(chip, WAITING_ICON_SVG, `${askCount} 待确认`);
+      }
+      // 点击顶栏审批徽标：回聊天视图 → 打开第一个有待确认的会话 → 滚动到该提问卡片
+      $('#askChip')?.addEventListener('click', () => {
+        _goChat();
+        const entry = Object.entries(runningJobs).find(([, job]) => job && job.ask);
+        if (entry) {
+          openConv(entry[0]);
+          setTimeout(() => {
+            document.querySelector('.ask-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+          }, 100);
+        }
+      });
+      // 打字机循环：把可见 job 的 shown 平滑推进到 text 长度，并实时刷新状态行
+      let typeTimer = null;
+      function ensureTyping() {
+        if (!typeTimer) typeTimer = setInterval(typeTick, 33);
+      }
+      function typeTick() {
+        const job = currentConvId ? runningJobs[currentConvId] : null;
+        if (!job) {
+          clearInterval(typeTimer);
+          typeTimer = null;
+          return;
+        }
+        const prevShown = job.shown;
+        if (job.shown < job.text.length) {
+          // 自适应步进：落后越多走越快，避免大突发长时间追不上
+          const backlog = job.text.length - job.shown;
+          job.shown = Math.min(job.text.length, job.shown + Math.max(2, Math.ceil(backlog / 8)));
+        }
+        const status = jobStatusText(job);
+        if (
+          job.shown !== job._paintedShown ||
+          status !== job._paintedStatus ||
+          job.rev !== job._paintedRev
+        ) {
+          job._paintedShown = job.shown;
+          job._paintedStatus = status;
+          job._paintedRev = job.rev;
+          paintJob(job);
+          // 流式输出时：对最新新增的文字片段做正文原地 scramble（正文已含新增文字，无需独立元素）
+          if (job.shown > prevShown && job.shown < job.text.length + 1) {
+            const newChunk = job.text.slice(prevShown, job.shown);
+            if (newChunk.trim()) { // 只对有实质内容的 chunk 做 scramble
+              const vb = bubbleAt(job.asstIndex);
+              if (vb) AnimeAnimations.startStreamScramble(vb, newChunk.length);
+            }
+          }
+        }
+      }
+
+      // ---- 额度状态 ----
+      function renderRateLimit(d) {
+        if (!contextProgress) return;
+        const map = {
+          allowed: 'normal',
+          allowed_warning: 'warning',
+          warning: 'warning',
+          rejected: 'danger',
+        };
+        const state = map[d.status] || 'normal';
+        contextProgress.updateRatelimitState(state, d.resetsAt || null);
+        contextProgress.show();
+
+        // 按额度状态调整对话输入框边框：接近上限=黄橙渐变，已用完=红色
+        promptEl.classList.remove('limit-warn', 'limit-full');
+        if (d.status === 'rejected') promptEl.classList.add('limit-full');
+        else if (d.status === 'allowed_warning' || d.status === 'warning')
+          promptEl.classList.add('limit-warn');
+      }
+
+      // 防连点/连按 Enter 的同步闸：clearPrompt 在首个 await 之后，第二个 send() 会读到同一段文字。
+      // 释放点在下面两处 clearPrompt 之后（输入框已空，重复事件会因 text 为空自然早退），
+      // finally 只是异常/提前 return 的兜底——防止闸永久卡死把发送功能锁掉。
+      let _sendGate = false;
+
+      // 提交幂等键（见 src/store/submissions.js）：同一条消息的网络重试/降级重启复用它，服务端据此去重
+      function newRequestId() {
+        try {
+          return crypto.randomUUID();
+        } catch {
+          /* 老引擎无 randomUUID：退化为时间戳 + 随机尾 */
+        }
+        return 'rq_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+      }
+
+      // ---- 发送（按会话隔离，支持多任务并行）----
+      async function send() {
+        const text = getPromptText();
+        if (!text) return;
+        if (_sendGate) return; // 重复提交：首个 send 尚在 await 中（clearPrompt 之前）
+        _sendGate = true;
+        const requestId = newRequestId();
+        // 附件清单必须在 clearPrompt 之前取（chip 与路径一起消失）。服务端据此把图片在模型边界
+        // 内联成 vision 输入（capabilities/image-attachments.logic.js）；Claude 路径不消费、不传。
+        const attachments = getPromptAttachments();
+        try {
+          return await sendInner(text, requestId, attachments);
+        } finally {
+          _sendGate = false;
+        }
+      }
+
+      async function sendInner(text, requestId, attachments = []) {
+        // 当前会话正在运行 → queue-first：默认排队（等当前任务完整结束后自动执行）；
+        // 想立即送达由排队卡片上的「立即发送」显式触发（steer-now，见 steerQueuedMsg）。
+        const running = currentConvId && runningJobs[currentConvId];
+        if (running) {
+          _goChat(); // 面板视图下发送 → 同样切回对话看排队卡片/流式输出
+          // userTyped：本文件唯一「字是用户在输入框敲的」的入口，服务端据此决定要不要记原始日志
+          //（记忆库数据采集层，见 src/store/user-log.js）。程序化发送不带这个标记，天然不入库。
+          return await queueSend(running, text, { userTyped: true, requestId, attachments });
+        }
+        _goChat(); // 面板视图下发送 → 回到对话看流式输出
+
+        const isNewConv = !currentConvId; // 本次 send 才建会话记录：用于待生效通知开关的补登记
+        if (!currentConvId) currentConvId = 'c' + String(Date.now());
+        lsSet('claude_last_conv', currentConvId); // 刷新后自动回到该会话
+        const convId = currentConvId; // 本次运行绑定的会话
+        const sessionId = currentSession; // 续接 id 快照
+        const runCwd = cwd;
+
+        await addMessage('user', text);
+        recordMessage('user', text);
+        // 新会话里预先点亮的飞书通知：此刻 conv 记录已建（有 cwd/标题），补登记。
+        // 非新会话或没点过开关时 conv-notify.js 内部自行 no-op（见其 onConvCreated）。
+        if (isNewConv && window.__convNotify) window.__convNotify.onConvCreated?.(convId);
+        clearPrompt();
+        _sendGate = false; // 输入框已清空：防连点闸放行（此后的重复事件会因 text 为空自然早退）
+        dropDraftAfterSend(convId); // 已发出：草稿作废，否则切走再回来会把这句话灌回输入框
+
+        // 助手占位：记一条空消息（标记进行中 + 待填 runId），并显示可见气泡
+        const asstIndex = convPushMessage(convId, 'assistant', '');
+        convSetMsgFields(convId, asstIndex, { pending: true });
+        addMessage('assistant', '');
+
+        // ★ 新增：种子前置（检查 seedPending 标记）
+        let finalText = text;
+        mutateConvs((list) => {
+          const conv = list.find(c => c.id === convId);
+          if (!conv || !conv.meta || !conv.meta.seedPending || !conv.meta.seedText) return false;
+          finalText = conv.meta.seedText + '\n\n' + text;
+          conv.meta.seedPending = false;  // 清除标记，后续消息不重复前置
+        });
+        // ultracode 前缀只进 prompt：气泡（上面 addMessage）与记忆库（launchRun 的 typedText）都是原文
+        finalText = decorateUltracode(finalText, { on: chatUltracode, provider: chatProvider });
+
+        // 同上：还原指令段只进 prompt，气泡与记忆库存原文
+        if (chatFigmaRestore && chatProvider === 'claude-agent' && !hasFigmaUrl(finalText)) {
+          // 开着却没贴链接：不拦截发送，只提示一次，避免用户以为已经触发了还原
+          toast('未检测到设计稿链接，本条按普通消息发送');
+        }
+        finalText = decorateFigmaRestore(finalText, { on: chatFigmaRestore, provider: chatProvider });
+
+        // 先建占位 job（es 待填），立即显示”运行中…”，避免 start 往返期间无反馈
+        const job = {
+          es: null,
+          asstIndex,
+          convId,
+          text: '',
+          shown: 0,
+          base: 0,
+          activities: [],
+          todos: [],
+          ask: null,
+          rev: 0,
+          err: false,
+          runId: null,
+        };
+        runningJobs[convId] = job;
+        updateComposerRunning();
+        renderConvListDebounced();
+        paintJob(job);
+        ensureTyping();
+
+        // 原有的 launchRun 调用，传 finalText 而非 text；typedText 另给用户原文（见 launchRun）
+        launchRun(job, finalText, sessionId, runCwd, null, { userTyped: true, typedText: text, requestId, attachments });
+      }
+
+      // 启动一次服务端 run 并接流（send 与插话竞态兜底共用）。
+      // 两步启动：先 POST /start 拿 runId（落库，关网页后可按它重连），再 attach SSE
+      // opts.userTyped：见 send() 的说明；opts.typedText：种子前置时 prompt 被系统拼过料，
+      // 用户原文得单独带上，否则记忆库的原始日志会混进需求种子这类系统正文。
+      // 与 prompt 相同时不带，免得大段粘贴内容在 body 里翻倍撞上 1MB 上限。
+      // opts.attachments（图片等附件元数据）：服务端只在 openai-compat 路径消费（模型边界内联成
+      // vision 输入）；Claude 路径靠正文路径 + SDK Read，带上也无害（busy inbox 会原样持有）。
+      function launchRun(job, text, sessionId, runCwd, modeOverride, opts = {}) {
+        const convId = job.convId;
+        const effectiveMode = modeOverride || chatMode;
+        // 程序化调用（sendMessageProgrammatically 等）没带 requestId 时兜底生成，保证每个提交都有幂等键
+        const requestId = opts.requestId || newRequestId();
+        const userMark = opts.userTyped
+          ? { userTyped: true, ...(opts.typedText && opts.typedText !== text ? { typedText: opts.typedText } : {}) }
+          : {};
+        const attachMark = Array.isArray(opts.attachments) && opts.attachments.length ? { attachments: opts.attachments } : {};
+        const startBody =
+          chatProvider === 'openai-compat'
+            ? { prompt: text, cwd: runCwd, session: sessionId, provider: 'openai-compat', model: chatCustomModel, credId: chatCustomCredId, convId, requestId, mode: effectiveMode, effort: runEffortForCurrent(), ultracode: chatUltracode, ...userMark, ...attachMark }
+            : { prompt: text, cwd: runCwd, session: sessionId, model: chatModel, effort: chatEffort, mode: effectiveMode, convId, requestId, ...userMark, ...attachMark };
+        fetch('/api/run/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(startBody),
+        })
+          .then((r) => r.json())
+          .then((d) => {
+            // 同会话已有 run 在跑（服务端 busy inbox 路由）：本条消息被排队（queue-first），
+            // 没有新起 run——撤下预建的用户气泡、转成排队卡片（见 adoptQueuedLaunch）。
+            if (d.queued) return adoptQueuedLaunch(job, d, text);
+            if (!d.runId) throw new Error(d.error || '启动失败');
+            job.runId = d.runId;
+            if (d.model) {
+              job.pickLabel = shortModel(d.model, d.effort); // 显示实际所用模型（自动模式尤其有用）
+              job._paintedStatus = '';
+            }
+            convSetMsgFields(convId, job.asstIndex, { runId: d.runId });
+            attachStream(convId, job.asstIndex, d.runId, job);
+            updateComposerRunning(); // runId 就绪 → 解锁插话
+            // Task 4：run 启动时更新侧栏运行灯
+            if (window._updateReqList) {
+              window._updateReqList();
+            }
+            if (job.stopping) abortRun(d.runId); // 期间点了停止 → 拿到 runId 后补发
+          })
+          .catch((err) => {
+            job.text = '⚠️ ' + (err && err.message ? err.message : '启动失败');
+            job.err = true;
+            job.shown = job.text.length;
+            convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+            convSetMsgFields(convId, job.asstIndex, { pending: false });
+            endJob(convId, true);
+          });
+      }
+
+      /**
+       * /start 撞上同会话运行中任务（服务端 busy inbox 收编，响应 queued:true）：没有新起 run。
+       * queue-first：把 send 流程预建的用户气泡撤下，消息转入输入框上方的排队卡片；
+       * 保留的助手占位气泡接管当前运行中 run 的流（照常看实时进度）。
+       * 「立即发送」（插进当前 run）由卡片动作显式触发（steerQueuedMsg）。
+       */
+      function adoptQueuedLaunch(job, d, text) {
+        const convId = job.convId;
+        if (!d.runId) throw new Error(d.error || '排队消息缺少关联任务，请重发');
+        job.runId = d.runId;
+        // 撤下用户气泡：三侧（存储/bubbleMap/DOM）同步移除，占位气泡索引随之前移
+        const conv = loadConvs().find((x) => x.id === convId);
+        const ui = job.asstIndex - 1;
+        if (conv && conv.messages[ui] && conv.messages[ui].role === 'user') {
+          const msgEl = convId === currentConvId ? bubbleAt(ui)?.closest?.('.msg') || null : null;
+          if (removeMessageAt(convId, ui)) {
+            if (msgEl) msgEl.remove();
+            job.asstIndex = Math.max(0, job.asstIndex - 1);
+          }
+        }
+        addQueueItem(convId, { id: d.msgId, text });
+        if (d.mode === 'follow_up') convFollowUpPending[convId] = true;
+        convSetMsgFields(convId, job.asstIndex, { runId: d.runId });
+        attachStream(convId, job.asstIndex, d.runId, job);
+        updateComposerRunning();
+        if (job.stopping) abortRun(d.runId); // 期间点了停止 → 拿到 runId 后补发
+      }
+
+      // 切段：当前助手气泡定稿，新开占位气泡接后续输出（排队消息进入任务时调用）。
+      // 后台会话只动存储侧（_bubbleMap/DOM 由 openConv 重建），可见会话双侧同步。
+      function splitSegment(job) {
+        const convId = job.convId;
+        const visible = convId === currentConvId;
+        if (job.text.length > job.base) {
+          // 本段已有文本 → 定稿当前助手气泡：写入本段全文（按 base 切分），刷新重连后顺序保持正确
+          convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+          convSetMsgFields(convId, job.asstIndex, { pending: false });
+          if (visible) {
+            const vb = bubbleAt(job.asstIndex);
+            if (vb) {
+              // 与 endJob 定稿一致：先停流式 scramble 动画，再渲染定稿内容
+              AnimeAnimations.stopStreamScramble();
+              renderMarkdown(vb, job.text.slice(job.base));
+            }
+          }
+          // 新占位气泡：记录 textBase（本气泡在 run 全文中的起点），后续输出切到这里
+          const asstIndex = convPushMessage(convId, 'assistant', '');
+          if (visible) addMessage('assistant', '');
+          job.base = job.text.length;
+          if (job.shown < job.base) job.shown = job.base;
+          convSetMsgFields(convId, asstIndex, { pending: true, runId: job.runId, textBase: job.base });
+          job.asstIndex = asstIndex;
+        } else {
+          // 本段尚无文本（还在跑工具/等首个 token）→ 定稿只会留下空白气泡；
+          // 改为把现有占位气泡（含工具日志）挪到排队消息之后继续接收输出。
+          // 存储与 DOM 必须同步移动，维持「存储索引=DOM 索引」不变量
+          const oldIndex = job.asstIndex;
+          // 分页模式下存储索引≠DOM索引，查 DOM 元素需换算（与 bubbleAt 同逻辑）
+          const _oldUnrendered = _msgPagingTotal > 0 ? _msgPagingTotal - _msgPagingOffset : 0;
+          const oldDomIndex = _oldUnrendered > 0 ? oldIndex - _oldUnrendered : oldIndex;
+          const msgEl = visible ? messagesEl.querySelectorAll('.msg')[oldDomIndex] : null;
+          const newIndex = moveMessageToEnd(convId, oldIndex); // 存储+_bubbleMap 两侧在 conv-store 内同步搬移
+          if (newIndex >= 0) {
+            if (msgEl) messagesEl.appendChild(msgEl);
+            job.asstIndex = newIndex;
+            if (visible) scrollBottom();
+          }
+        }
+        job._paintedShown = -1;
+        if (visible) {
+          paintJob(job);
+          ensureTyping();
+        }
+      }
+
+      /**
+       * 运行中发送（queue-first）：把消息排进服务端队列（不新起 run、不插当前 run），
+       * 卡片出现在输入框上方；当前任务完整结束后由服务端排空起下一轮自动执行。
+       * 用户点卡片「立即发送」才走 steer-now（steerQueuedMsg → /api/run/msg/now）。
+       * 竞态：run 恰好结束（/send 回 ok:false）或网络失败 → 降级为新一轮（与旧插话降级同范式）。
+       */
+      async function queueSend(job, text, opts = {}) {
+        if (!job.runId) return toast('任务正在启动，稍候再发'); // 文本留在输入框
+        const requestId = opts.requestId || newRequestId(); // 幂等键：本次排队的重试/降级重启复用
+        const convId = job.convId;
+        clearPrompt();
+        _sendGate = false; // 输入框已清空：防连点闸放行（同 sendInner 的释放点）
+        dropDraftAfterSend(convId); // 已发出：草稿作废
+        let d = null;
+        try {
+          d = await (
+            await fetch('/api/run/send', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              // userTyped 见 send()；服务端只在消息真被排队（ok:true）时才记，与降级路径不会重复计一条。
+              // attachments（图片等）：进排队项，openai 路径的模型边界据此内联出 vision 输入。
+              body: JSON.stringify({
+                runId: job.runId,
+                text,
+                requestId,
+                ...(opts.userTyped ? { userTyped: true } : {}),
+                ...(Array.isArray(opts.attachments) && opts.attachments.length ? { attachments: opts.attachments } : {}),
+              }),
+            })
+          ).json();
+        } catch {
+          d = null; // 网络失败：走下面的降级（新一轮经 /start 重新排进 busy inbox）
+        }
+        if (!d || !d.ok) {
+          // run 恰好结束 → 降级为新一轮：先补用户气泡 + 切段（与旧插话降级同范式）再重启
+          await addMessage('user', text);
+          recordMessage('user', text);
+          splitSegment(job);
+          restartAsNewRun(job, text, { ...opts, requestId }); // userTyped 必须跟着降级路径走，否则用户这句话就不入库了
+          return;
+        }
+        addQueueItem(convId, { id: d.msgId, text });
+        // done 后要提前轮询才能及时接上排空起的新 run
+        if (d.mode === 'follow_up') convFollowUpPending[convId] = true;
+        // SSE 与 fetch 响应是两条连接，consumed 可能先到（秒级消费的极端竞态）：直接按已投递上屏
+        if (job._consumedIds && job._consumedIds.has(d.msgId)) {
+          await handleQueueConsumed(convId, [d.msgId], job);
+        }
+      }
+
+      // 插话竞态兜底：run 已在注入前结束 → 把这条消息作为新一轮发出（resume 续接），复用占位气泡
+      function restartAsNewRun(job, text, opts = {}) {
+        const convId = job.convId;
+        // 登记守卫：runningJobs 已被别的 run 占据（先前降级已重启 / 用户已另发新消息）→ 本次插话放弃降级
+        if (runningJobs[convId] && runningJobs[convId] !== job) {
+          toast('插话未送达，请重发');
+          return;
+        }
+        // 先关旧流：防止旧 run 的 done 事件把新登记的 job 误终结
+        try {
+          if (job.es) job.es.close();
+        } catch {}
+        delete runningJobs[convId];
+        const conv = loadConvs().find((x) => x.id === convId);
+        const newJob = {
+          es: null,
+          asstIndex: job.asstIndex,
+          convId,
+          text: '',
+          shown: 0,
+          base: 0,
+          activities: [],
+          todos: [],
+          ask: null,
+          rev: 0,
+          err: false,
+          runId: null,
+        };
+        convSetMsgFields(convId, job.asstIndex, { pending: true, runId: null, textBase: 0 });
+        runningJobs[convId] = newJob;
+        refreshAskChip(); // 旧 job 的挂起审批（若有）随重启一并作废
+        updateComposerRunning();
+        renderConvList();
+        paintJob(newJob);
+        ensureTyping();
+        launchRun(newJob, text, conv ? conv.session : currentSession, conv ? conv.cwd : cwd, null, opts);
+      }
+
+      // 请求服务端中断某 run（手动”停止” / start 期间补发）
+      /**
+       * 请求服务端中止某 run。
+       * 返回值很关键：服务端对「不存在 / 已终结」的 run 直接回 {ok:false} 且**不发任何 SSE 事件**
+       * （后端重启后注册表已清空、run 被 gc、网络中断都会走到这里）。
+       * 此前这里 `.catch(() => {})` 完全不看响应，于是 endJob 永远不被触发
+       * → 全屏遮罩永不消失、stopBtn 永久停在「中止中…」，只能刷新页面。
+       */
+      function abortRun(runId) {
+        if (!runId) return Promise.resolve(null);
+        return fetch('/api/run/abort', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ runId }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d) => (d && typeof d.ok === 'boolean' ? d.ok : null))
+          .catch(() => null); // 网络失败：当作「服务端不会再来消息」，由调用方本地收尾
+      }
+
+      // ---- 停止中遮罩（延迟出现，快速完成时不闪烁）----
+      let _stoppingOverlayEl = null;
+      let _stoppingOverlayTimer = null;
+      function showStoppingOverlay() {
+        if (_stoppingOverlayEl) return;
+        _stoppingOverlayEl = document.createElement('div');
+        _stoppingOverlayEl.className = 'stopping-overlay';
+        // 注意引号：这里原本写的是中文弯引号 ”…”，解析出的 class 值是「”stopping-box”」，
+        // 与 app.css 的 .stopping-box / .stopping-spinner 全都匹配不上 —— 遮罩里既没有卡片
+        // 也没有转圈，只有一行裸文字。必须用 ASCII 双引号。
+        _stoppingOverlayEl.innerHTML =
+          '<div class="stopping-box">' +
+          '<div class="stopping-spinner"></div>' +
+          '<span>会话中止中...</span>' +
+          '<button type="button" class="stopping-dismiss">关闭</button>' +
+          '</div>';
+        // 逃生出口：点遮罩空白处或「关闭」都能撤下它。
+        // 遮罩是 position:fixed;inset:0;z-index:200 的全屏元素，没有出口就等于锁死整个界面。
+        _stoppingOverlayEl.addEventListener('click', hideStoppingOverlay);
+        document.body.appendChild(_stoppingOverlayEl);
+        // 兜底超时：即便所有信号都没来，10s 后也自行撤下，绝不把界面永久卡住
+        _stoppingOverlayTimer = setTimeout(hideStoppingOverlay, 10000);
+      }
+      function hideStoppingOverlay() {
+        if (_stoppingOverlayTimer) {
+          clearTimeout(_stoppingOverlayTimer);
+          _stoppingOverlayTimer = null;
+        }
+        if (_stoppingOverlayEl) {
+          _stoppingOverlayEl.remove();
+          _stoppingOverlayEl = null;
+        }
+        // 遮罩撤下时一并恢复按钮：否则遮罩没了、按钮还停在「中止中…」，仍然发不出消息
+        stopBtn.disabled = false;
+        stopBtn.textContent = '停止';
+      }
+
+      // 停止当前会话正在运行的 run（发送按钮右侧”停止”）
+      function stopCurrentRun() {
+        const convId = currentConvId; // 快照：响应回来时用户可能已切走会话，不能收尾错对象
+        const job = convId && runningJobs[convId];
+        if (!job) return;
+        job.stopping = true;
+        // 等待重试/续跑期间点停止：run 早已终结，/api/run/abort 会回 {ok:false}（也就没 SSE 收尾），
+        // 而服务端 2 秒后照样 doResume → 任务自己活过来。这里改为撤销待续跑登记 + 本地中性收尾。
+        // dismiss 端点会把「已起跑但前端还没接上」的重试 run 一并中止（见 routes-run 的窄竞态注释）。
+        if (job.pending) {
+          dismissPending(convId);
+          if (!job.text.slice(job.base).includes('⏹')) {
+            job.text += (job.text ? '\n\n' : '') + '⏹ 已手动停止';
+            job.shown = job.text.length;
+            convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+          }
+          convSetMsgFields(convId, job.asstIndex, { pending: false });
+          endJob(convId, false); // 中性收尾，不标红
+          return;
+        }
+        if (job.runId) {
+          // 必须看返回值：服务端对不存在/已终结的 run 回 {ok:false} 且不发 SSE，
+          // 不本地收尾的话 endJob 永远不会被触发，界面就被遮罩锁死了。
+          abortRun(job.runId).then((ok) => {
+            if (ok === false || ok === null) endJob(convId, false);
+          });
+        } // 无 runId 时待 start 返回后补发
+        // 立即给按钮反馈，防止重复点击
+        stopBtn.disabled = true;
+        stopBtn.textContent = '中止中…';
+        // 超过 800ms 未完成则出现全屏遮罩，快速完成时不闪烁
+        job._stoppingTimer = setTimeout(showStoppingOverlay, 800);
+      }
+
+      // 附加到某服务端 run 的 SSE 流（起始发送 & 关网页后重连共用）。
+      // job 可复用 send() 预建的占位；openConv 重连时不传，由本函数新建。
+      function attachStream(convId, asstIndex, runId, job) {
+        // 带上 convId：run 已从内存注册表消失时（进程重启/已 GC），服务端无从反查它属于哪个会话
+        //（settleRun 也已把它从 run-index.json 删掉），拿不到 convId 就查不了有没有续跑计划。
+        const es = new EventSource(
+          '/api/run?runId=' + encodeURIComponent(runId) + '&convId=' + encodeURIComponent(convId || ''),
+        );
+        if (!job) {
+          const conv = loadConvs().find((x) => x.id === convId);
+          const msg = conv && conv.messages[asstIndex];
+          job = {
+            es,
+            asstIndex,
+            convId,
+            text: '',
+            shown: 0,
+            base: (msg && msg.textBase) || 0, // 插话切段后重连：从持久化偏移恢复
+            activities: [],
+            todos: [],
+            ask: null,
+            rev: 0,
+            err: false,
+            runId,
+            pending: false, // SSE 连接状态：true 表示静默等待（run 不存在后的过渡态）
+          };
+          runningJobs[convId] = job;
+          updateComposerRunning();
+          renderConvList();
+          if (convId === currentConvId) {
+            paintJob(job);
+            ensureTyping();
+          }
+        }
+        // 如果已有旧 ES（run 不存在后重连），关闭它
+        if (job.es && job.es !== es) {
+          try {
+            job.es.close();
+          } catch {}
+        }
+        job.es = es;
+        job.runId = runId;
+
+        const visible = () => convId === currentConvId;
+        const saveThrottled = () => {
+          const now = Date.now();
+          if (now - (job._lastSave || 0) > 400) {
+            job._lastSave = now;
+            convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+          }
+        };
+
+        es.addEventListener('session', (e) => {
+          let data;
+          try {
+            data = JSON.parse(e.data);
+          } catch (err) {
+            console.warn('[session event] JSON 解析错误，跳过:', err);
+            return;
+          }
+
+          const sid = data.session_id;
+          if (!sid) return;
+          convSetSession(convId, sid);
+          if (visible()) currentSession = sid;
+          // 服务端的通知登记表存的是 session/cwd 快照，飞书补充内容靠它 resume 回原会话；
+          // session 要到这一刻才拿得到，所以在此同步（全局桥：conv-notify.js 未加载时静默跳过）
+          if (window.__convNotify) window.__convNotify.sync(convId);
+
+          // ★ 新增：若 conv 带 reqId，回填 sessionId 到后端
+          const conv = loadConvs().find(c => c.id === convId);
+          if (conv && conv.meta && conv.meta.reqId && data.session_id) {
+            // 异步回填，不阻塞流程
+            fetch('/api/req/session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: conv.meta.reqId,
+                convId: conv.id,
+                sessionId: data.session_id
+              })
+            }).catch(err => console.warn('Failed to report sessionId:', err));
+          }
+        });
+        // 重放：服务端权威全文 —— 重置（而非追加），兼容自动重连的重复重放
+        es.addEventListener('replay', (e) => {
+          const d = JSON.parse(e.data);
+          job.text = d.text || '';
+          job.shown = job.text.length;
+          job.activities = Array.isArray(d.activities) ? d.activities : [];
+          job.todos = Array.isArray(d.todos) ? d.todos : [];
+          job.ask = d.ask || null; // 重连时恢复待答问题
+          job.notices = {}; // 重连时恢复非阻塞提示卡（「问同事」）
+          for (const n of Array.isArray(d.notices) ? d.notices : []) job.notices[n.id] = n;
+          if (d.model && d.model.model) job.pickLabel = shortModel(d.model.model, d.model.effort); // auto 判档标签
+          job.rev++;
+          if (d.session_id) {
+            convSetSession(convId, d.session_id);
+            if (visible()) currentSession = d.session_id;
+          }
+          convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+          if (visible()) {
+            job._paintedShown = -1;
+            paintJob(job);
+            ensureTyping();
+          }
+          // 排队卡片对账：服务端清单是唯一真相（重连/关页期间被投递的项由 merge 判定上屏）
+          syncQueue(convId);
+          refreshAskChip();
+        });
+        es.addEventListener('chunk', (e) => {
+          job.text += JSON.parse(e.data).text;
+          saveThrottled();
+          if (visible()) ensureTyping();
+        });
+        es.addEventListener('activity', (e) => {
+          const s = JSON.parse(e.data).summary || '';
+          if (s) {
+            job.activities.push(s); // 累积工具转录
+            if (job.activities.length > 50) job.activities.shift();
+            job.rev++;
+          }
+          if (visible()) ensureTyping();
+        });
+        es.addEventListener('todos', (e) => {
+          job.todos = JSON.parse(e.data).todos || []; // TodoWrite 任务清单
+          job.rev++;
+          if (visible()) ensureTyping();
+        });
+        es.addEventListener('ask', (e) => {
+          job.ask = JSON.parse(e.data); // { reqId, kind, title, body, options } 等待用户决策
+          job.rev++;
+          if (visible()) ensureTyping();
+          refreshAskChip();
+        });
+        // 非阻塞提示卡（「问同事」问题+选项）：推送/收起，可多张并存
+        es.addEventListener('notice', (e) => {
+          const n = JSON.parse(e.data); // { id, kind, title, body, options }
+          job.notices = job.notices || {};
+          job.notices[n.id] = n;
+          job.rev++;
+          if (visible()) ensureTyping();
+        });
+        es.addEventListener('notice-dismiss', (e) => {
+          const id = JSON.parse(e.data).id;
+          if (job.notices) delete job.notices[id];
+          job.rev++;
+          if (visible()) ensureTyping();
+        });
+        // auto 模式：判档异步于 /start 返回，实际所用模型经此事件补告
+        es.addEventListener('model', (e) => {
+          const d = JSON.parse(e.data);
+          if (d.model) {
+            job.pickLabel = shortModel(d.model, d.effort);
+            job._paintedStatus = ''; // 强制状态行重绘出新标签
+            if (visible()) ensureTyping();
+          }
+        });
+        // 排队卡片条对账：服务端清单变化（入队/撤回/回队）→ 拉 /api/run/queue 刷新
+        es.addEventListener('queue', () => syncQueue(convId));
+        es.addEventListener('follow_up', () => syncQueue(convId));
+        es.addEventListener('follow_up_cancelled', () => syncQueue(convId));
+        es.addEventListener('steer_requeued', () => syncQueue(convId));
+        es.addEventListener('ratelimit', (e) => renderRateLimit(JSON.parse(e.data)));
+        // 自定义模型：每个模型步一次的用量 → 顶栏「上下文 xx%」。
+        // 先落会话记录再渲染（切走再切回、刷新后都还在），渲染只认会话记录这一份数据。
+        es.addEventListener('usage', (e) => {
+          convSetContextUsage(convId, JSON.parse(e.data));
+          if (visible()) renderContextUsage();
+        });
+        // 排队消息进入任务（steer-now 消费）：卡片上屏为普通用户消息 + 切段（新助手占位排到其后）
+        es.addEventListener('consumed', (e) => {
+          const ids = JSON.parse(e.data).msgIds || [];
+          // 累积已消费 id：卡片登记（/send 响应）可能晚于本事件，登记回填后据此补上屏
+          if (!job._consumedIds) job._consumedIds = new Set();
+          ids.forEach((x) => job._consumedIds.add(x));
+          handleQueueConsumed(convId, ids, job);
+        });
+        es.addEventListener('done', (e) => {
+          const d = JSON.parse(e.data);
+          // 排队卡片对账：终结口可能已把队列排空/回队（queue-first），以服务端清单为准
+          syncQueue(convId);
+          if (Array.isArray(d.unsent) && d.unsent.length) {
+            // 遗留（老版本 localStorage）未发送标记：排队消息现在走卡片条，转录里的旧字段一并清掉
+            const conv = loadConvs().find((x) => x.id === convId);
+            if (conv) {
+              conv.messages.forEach((m, i) => {
+                if (m.msgId && d.unsent.includes(m.msgId)) convSetMsgFields(convId, i, { queued: false, unsent: false });
+              });
+            }
+          }
+          if (!job.text && d.result) job.text = d.result;
+          if (d.subtype === 'stopped') {
+            // 只扫当前段：插话定稿的前段若恰含同款标记，不应挡掉本段追加
+            if (!job.text.slice(job.base).includes('⏹')) job.text += (job.text ? '\n\n' : '') + '⏹ 已手动停止';
+          } else if (d.subtype === 'quota_blocked') {
+            if (d.result) job.text = d.result; // 服务端已附「额度用尽，将自动续跑」提示
+          } else if (d.subtype === 'exception_retry') {
+            // 异常但服务端已排程重试：不标红、不 endJob，spinner 继续转，等新 run 接流
+            if (d.result) job.text = d.result; // 服务端已附「原因 + N 秒后自动重试」
+            if (job.base > job.text.length) job.base = 0;
+            job.shown = job.text.length;
+            convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+            job.pending = true; // 复用「run 不存在静默等待」语义：refreshPending 切到新 runId 时重新接流
+            // 必须显式关流：服务端 closeAll 只是 res.end()，EventSource 会自动重连去拉这个已终结的
+            // run，撞上「已结束 run 补发 done」→ 无限循环（同下方 run 不存在分支的处理）
+            try {
+              job.es.close();
+            } catch {}
+            scheduleRetryPolls(d.retryInMs);
+            if (visible()) ensureTyping();
+            return; // 不走下面的收尾：气泡要保持 pending，刷新页面才能重连
+          } else if (d.is_error) {
+            job.err = true; // 异常结束：明确标注 subtype，区分“跑完”与“异常退出”
+            if (d.result && d.result.includes('⚠️')) job.text = d.result; // 服务端已附具体原因（如看门狗），不要丢
+            if (!job.text.slice(job.base).includes('⚠️')) {
+              job.text +=
+                (job.text ? '\n\n' : '') +
+                '⚠️ Claude 异常结束' +
+                (d.subtype && d.subtype !== 'success' ? `（${d.subtype}）` : '');
+            }
+            // 看门狗/超时路径：服务端 abortRun 先 failRun 广播了这条红字（SSE 已关），随后
+            // settleRun 才可能排程重试 —— 此时拿不到 exception_retry 信号，只能靠提前轮询接新 run。
+            scheduleRetryPolls();
+          }
+          if (job.base > job.text.length) job.base = 0; // 兜底：镜像被短错误文本替换（run 已被 GC）时归零，避免切空
+          if (!job.text.slice(job.base)) job.text += '(无输出)'; // 按段判空：插话后本段无新增输出也给占位
+          job.shown = job.text.length; // 收尾补完剩余字符
+          convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+          convSetMsgFields(convId, job.asstIndex, { pending: false });
+          // 有排队 follow-up（busy inbox）：排空起的新 run 已在服务端诞生，提前轮询尽快接上（15s 周期兜底）
+          if (convFollowUpPending[convId]) pollPendingSoon();
+          endJob(convId, job.err);
+        });
+        es.addEventListener('error', (e) => {
+          if (e.data) {
+            // 服务端主动报错（如 run 不存在/已过期）
+            let m = '发生错误';
+            try {
+              m = JSON.parse(e.data).message;
+            } catch {}
+            // 「run 不存在」：进程重启后 run 注册表清空，但 pending 机制会续跑。
+            // 改为静默等待（不报错），让 refreshPending 的 resuming 分支自动接新 run 流
+            if (m.includes('run 不存在') || m.includes('已过期')) {
+              // 进程重启：持有区丢失，但排队队列在盘上（启动恢复会补排空）——以服务端清单对账。
+              // 边界：run 已正常跑完但被 GC 时也走此路径，merge 对账可能把实际已消费的项上屏（保守：宁可上屏）
+              syncQueue(convId);
+              const conv = loadConvs().find((x) => x.id === convId);
+              if (conv) {
+                conv.messages.forEach((msg, i) => {
+                  if (msg.queued && msg.runId === runId) convSetMsgFields(convId, i, { queued: false, unsent: false });
+                });
+              }
+              es.close();
+              // 服务端明确说了「这个会话没有续跑计划」→ 再等下去没有任何人会送新 run 上来，
+              // 气泡会永久停在「运行中…」（2026-08-28 事故的后半段）。中性终结，不标红：
+              // 任务不是失败，是早就结束了、只有本地状态过期。
+              // resumePlanned 为 null/缺失（老服务端、或没传 convId）时按未知处理，沿用静默等待。
+              let planned = null;
+              try {
+                planned = JSON.parse(e.data).resumePlanned;
+              } catch {}
+              if (planned === false) {
+                if (!job.text.slice(job.base).includes('⏹')) {
+                  job.text += (job.text ? '\n\n' : '') + '⏹ 任务已结束（进程重启，无自动续跑）';
+                }
+                job.shown = job.text.length;
+                if (job.base > job.text.length) job.base = 0;
+                convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+                convSetMsgFields(convId, job.asstIndex, { pending: false });
+                endJob(convId, false); // 中性收尾，不标红
+                return;
+              }
+              job.pending = true; // 标记为等待状态，refreshPending 据此切换 runId 时重新接流
+              return;
+            }
+            // 其它错误 → 正常报错并终结
+            job.text = (job.text ? job.text + '\n\n' : '') + '⚠️ ' + m;
+            job.err = true;
+            job.shown = job.text.length;
+            if (job.base > job.text.length) job.base = 0; // 兜底：镜像被短错误文本替换（run 已被 GC）时归零，避免切空
+            convSetMessage(convId, job.asstIndex, job.text.slice(job.base));
+            convSetMsgFields(convId, job.asstIndex, { pending: false });
+            endJob(convId, true);
+          }
+          // 无 e.data：传输层断开，EventSource 会自动重连并重放，无需处理（spinner 继续转）
+        });
+      }
+
+      /** 需求系统任务（自动开发/API 修正/BUG 修复）的 run 由服务端发起：本地既无 runningJobs、
+       *  会话里也没有预塞的 pending 气泡，openConv 的三条重连路径全不命中 → 主体区只剩顶部 busy 芯片、
+       *  看不到实现进度。req-chat 在 busy.runId 出现时调用本函数，补种一个 pending 助手气泡并接管该 run
+       *  的流（attachStream 的 replay 会从服务端拉回已产出的权威全文），之后与普通任务完全一致：
+       *  逐字进度 / 工具活动 / TodoWrite 面板都可见，且 job.runId 就绪即可插话（随时发消息纠偏）。
+       *  幂等：同一 run 反复调用（3s 轮询）只接一次；系统任务前后接替（develop→api-fix，runId 变）
+       *  时旧 job 已被 endJob 清除，自然补种新气泡。 */
+      export function ensureConvRunAttached(convId, runId) {
+        if (!convId || !runId) return;
+        if (convId !== currentConvId) return; // 只为当前查看的会话接流，避免把气泡塞到别的会话
+        const existing = runningJobs[convId];
+        if (existing && existing.runId === runId) return; // 已接同一 run，勿重复接
+        // 刷新页面后 openConv 可能已按持久化的 pending 气泡重连过：会话里已存在该 run 的 pending 气泡则不重复接
+        const conv = loadConvs().find((x) => x.id === convId);
+        if (conv && conv.messages.some((m) => m.pending && m.runId === runId)) return;
+        const idx = convPushMessage(convId, 'assistant', '');
+        convSetMsgFields(convId, idx, { pending: true, runId });
+        addMessage('assistant', '');
+        attachStream(convId, idx, runId);
+      }
+
+      /** 飞书补充内容上屏：服务端注入的用户消息本地没有气泡（消息不是从本浏览器发出的），
+       *  这里补种「用户气泡 + 助手 pending 气泡」并接管该 run 的流，与本地发送后的形态完全一致。
+       *  只处理当前会话：addMessage 只会把气泡登记进 currentConvId 的 _bubbleMap，
+       *  非当前会话上屏会当场撕裂「存储=DOM=_bubbleMap 三方同序」不变量，故直接放弃（留给下次 openConv 轮询补）。
+       *  幂等：ensureConvRunAttached 自带 runId 去重；用户气泡自查 msgId（见下）。
+       *  返回已上屏的 item id 数组，调用方据此调 /claim。 */
+      export async function applyInjectedItems(convId, items) {
+        if (!convId || convId !== currentConvId || !Array.isArray(items) || !items.length) return [];
+        const applied = [];
+        for (const it of items) {
+          if (!it || !it.text) continue;
+          // 幂等闸（纵深防御）：/claim 是 fire-and-forget，丢一次包这条就还留在服务端收件箱，
+          // 下一轮轮询又把它上一次屏 —— 同一句补充内容堆出一串重复气泡（2026-08-28 事故形态）。
+          // 跳过的 id 仍要计入 applied：它确实已经上过屏了，不认领条目就永远清不掉。
+          const conv0 = loadConvs().find((x) => x.id === convId);
+          if (conv0?.messages.some((m) => m.msgId === it.id)) {
+            applied.push(it.id);
+            continue;
+          }
+          const idx = convPushMessage(convId, 'user', it.text);
+          if (idx < 0) continue; // 会话已被删除：落库失败就不能上屏，否则 DOM 比存储多一条
+          convSetMsgFields(convId, idx, { msgId: it.id });
+          await addMessage('user', it.text);
+          // 只接**还在跑**的 run（alive 由服务端 /inbox 判定）：runId 是注入那一刻的，隔天再进
+          // 会话时它早已随进程消失。接死 run 会落进 SSE 的「run 不存在 → 静默等待续跑」分支，
+          // 而这条路径不会有续跑条目，气泡就永久停在「运行中…」——用户看到的「没有响应」。
+          if (it.alive && it.runId) ensureConvRunAttached(convId, it.runId);
+          // P4 排队语义（openai 运行中注入）：消息要等当前 run 终结后才排空起下一轮，
+          // 标记后由 done 提前轮询接上排空 run；气泡保持「等待进入任务」。
+          if (it.mode === 'follow_up') convFollowUpPending[convId] = true;
+          applied.push(it.id);
+        }
+        return applied;
+      }
+
+      /**
+       * 绕过输入框直接发送一条消息：自动开发/api-fix/准则更新等「程序化发送」场景。
+       * 若当前会话正在运行 → 插话（steer）；否则 → 新起一轮（launchRun）。
+       * opts.mode：权限模式覆盖（如 'bypassPermissions'），不影响用户后续输入框发送的默认模式。
+       * 前置条件：currentConvId 已就位（由调用方确保，通常在 openConv 之后）。
+       */
+      export async function sendMessageProgrammatically(text, opts = {}) {
+        if (!text || !currentConvId) return;
+        const running = runningJobs[currentConvId];
+        if (running) {
+          // 当前 run 进行中 → queue-first 排队（等当前任务完整结束后自动执行；卡片可看可撤）
+          return await queueSend(running, text);
+        }
+        const convId = currentConvId;
+        const sessionId = currentSession;
+        const runCwd = cwd;
+
+        await addMessage('user', text);
+        recordMessage('user', text);
+        // 不清空输入框（clearPrompt）——这不是用户输入
+
+        const asstIndex = convPushMessage(convId, 'assistant', '');
+        convSetMsgFields(convId, asstIndex, { pending: true });
+        addMessage('assistant', '');
+
+        const job = {
+          es: null,
+          asstIndex,
+          convId,
+          text: '',
+          shown: 0,
+          base: 0,
+          activities: [],
+          todos: [],
+          ask: null,
+          rev: 0,
+          err: false,
+          runId: null,
+        };
+        runningJobs[convId] = job;
+        updateComposerRunning();
+        renderConvListDebounced();
+        paintJob(job);
+        ensureTyping();
+
+        launchRun(job, text, sessionId, runCwd, opts.mode || null);
+      }
+
+      const _reqTranscriptTried = new Set(); // convId:sessionId 本会话周期已尝试回放，避免 mount 抖动重复请求
+      /** 已完成的开发/系统任务：其过程只有在「客户端当时正挂着实时流」时才落 localStorage；若当时无人观看，
+       *  会话里就空空如也（正是「点开已完成需求看不到运行过程」的成因）。但 Claude 的 session 转录一直在磁盘上
+       *  （req.devSession）。本函数在「无实时流且会话无内容」时，按 devCwd 定位并拉取 session 转录
+       *  （GET /api/history/:sid?cwd=）整体回放到聊天区。注意：history 抽取只保留文本块（助手叙述/结果），
+       *  工具活动细节不在其中——与需求会话既有的转录回放一致。 */
+      export async function loadReqTranscript(convId, sessionId, cwd) {
+        if (!convId || !sessionId || convId !== currentConvId) return;
+        if (runningJobs[convId]) return; // 有实时流在跑 → 交给流，别灌历史
+        const conv0 = loadConvs().find((x) => x.id === convId);
+        if (conv0 && conv0.messages.some((m) => (m.text || '').trim())) return; // 已有输出（实时流已落库/已灌过）
+        const key = convId + ':' + sessionId;
+        if (_reqTranscriptTried.has(key)) return; // 本周期只尝试一次（mount + 3s 轮询会反复调）
+        _reqTranscriptTried.add(key);
+        let json;
+        try {
+          const r = await fetch('/api/history/' + encodeURIComponent(sessionId) + '?cwd=' + encodeURIComponent(cwd || ''));
+          json = await r.json();
+        } catch {
+          _reqTranscriptTried.delete(key); // 网络失败：允许下次重试
+          return;
+        }
+        if (!json?.ok || convId !== currentConvId || runningJobs[convId]) return; // 往返期间切走/实时流已起 → 放弃
+        const msgs = json.data?.messages || [];
+        if (!msgs.length) return; // 无转录（会话未落盘/被清）——保持空态
+        // 二次校验与清空必须在同一次「读最新→改→写回」里（await 期间别的窗口可能刚给这条会话灌过内容）
+        const cleared = mutateConvs((list) => {
+          const c = list.find((x) => x.id === convId);
+          if (!c || c.messages.some((m) => (m.text || '').trim())) return false; // 往返期间已有内容
+          c.messages = [];
+        });
+        if (!cleared) return;
+        // 重建：清 DOM + 气泡缓存，再按转录整体重灌（此路径必无实时流，三方同序安全）
+        messagesEl.querySelectorAll('.msg').forEach((el) => el.remove());
+        bubbleReset(convId);
+        emptyEl.style.display = 'none';
+        for (const m of msgs) {
+          convPushMessage(convId, m.role, m.content);
+          await addMessage(m.role, m.content);
+        }
+      }
+
+      /** 为目录开新项目窗口（一窗一项目）：Tauri 经 win_new（上下文由 Rust initialization_script 注入，
+       *  不走 URL query——打包版 custom protocol 下 query 会致新窗白屏）；浏览器开新标签走 URL。 */
+      function openProjectWindow(dir, convId) {
+        const label = '已在新窗口打开：' + (baseName(dir) || '(服务目录)');
+        if (window.tauriApi?.isTauri && window.tauriApi.invoke) {
+          window.tauriApi
+            .invoke('win_new', { cwd: dir, conv: convId || null })
+            .then(() => toast(label))
+            .catch((e) => toast('开新窗口失败：' + (e?.message || e)));
+        } else {
+          const query = '?cwd=' + encodeURIComponent(dir) + (convId ? '&conv=' + encodeURIComponent(convId) : '');
+          window.open('/' + query, '_blank');
+          toast(label);
+        }
+      }
+      function selectDir(p) {
+        // 一窗一项目：本窗已有项目目录且选了不同目录 → 新窗口承载新项目，本窗不动
+        if (cwd && p && p !== cwd) {
+          closeDirModal();
+          openProjectWindow(p);
+          return;
+        }
+        cwd = p;
+        reinitializeGitSelector();
+        probeOptimizeBadge(p); // 换项目：标签必须跟着换，否则会把 A 项目的体检显示在 B 上
+        lsSet('claude_cwd', cwd);
+        saveUiPrefs(); // 同步到服务端配置
+        refreshDirLabel();
+        closeDirModal();
+        renderConvListDebounced.flush(); // 会话列表按 cwd 过滤，切目录后须立即重渲
+      }
+
+      // ---- 事件绑定 ----
+      sendBtn.addEventListener('click', send);
+      stopBtn.addEventListener('click', stopCurrentRun);
+
+      // 模型 / 强度悬浮控件（右下角，极简）
+      // 强度档位 = Claude SDK EffortLevel（与设置页选单对齐；原先前端只有 4 档、设置页的 max 会被白名单丢掉）
+      const EFFORTS = CLAUDE_EFFORTS;
+
+      // 内置工具清单按 provider 分叉（Claude 走 SDK 工具、自定义模型走本仓自研工具集），
+      // 数据与分叉逻辑在 tool-list.logic.js（含单测）。
+      // 与 run-claude.js TOOL_DISABLE_ALIASES 的逻辑名保持一致。
+
+      /** 创建一个工具行 DOM（含 toggle switch）；disabled 用于「未安装/不可用」的置灰态 */
+      function makeToolRow(labelText, descText, enabled, onChange, { disabled = false } = {}) {
+        const row = document.createElement('div');
+        row.className = 'tool-row';
+        const nameEl = document.createElement('span');
+        nameEl.className = 'tool-row-name' + (enabled ? '' : ' off');
+        nameEl.textContent = labelText;
+        nameEl.title = descText;
+        const lbl = document.createElement('label');
+        lbl.className = 'tool-toggle' + (disabled ? ' disabled' : '');
+        lbl.title = disabled ? descText : enabled ? '点击禁用' : '点击启用';
+        const inp = document.createElement('input');
+        inp.type = 'checkbox';
+        inp.checked = enabled;
+        inp.disabled = disabled;
+        inp.addEventListener('change', () => {
+          nameEl.className = 'tool-row-name' + (inp.checked ? '' : ' off');
+          lbl.title = inp.checked ? '点击禁用' : '点击启用';
+          onChange(inp.checked);
+        });
+        const slider = document.createElement('span');
+        slider.className = 'toggle-slider';
+        lbl.appendChild(inp);
+        lbl.appendChild(slider);
+        row.appendChild(nameEl);
+        row.appendChild(lbl);
+        return row;
+      }
+
+      /** 渲染内置工具 + MCP 服务器 toggle 列表 */
+      async function refreshToolsSection() {
+        const builtinList = document.getElementById('builtinToolsList');
+        const mcpList = document.getElementById('mcpToolsList');
+        const mcpDivider = document.getElementById('mcpToolsDivider');
+        if (!builtinList) return;
+
+        // 内置工具（按 provider 分叉：自定义模型展示 openai 路径真实装配的工具集）
+        builtinList.innerHTML = '';
+        builtinToolsFor(chatProvider).forEach(({ id, label, desc }) => {
+          const enabled = !chatDisabledTools.includes(id);
+          const row = makeToolRow(label, desc, enabled, (checked) => {
+            if (checked) {
+              chatDisabledTools = chatDisabledTools.filter((t) => t !== id);
+            } else {
+              if (!chatDisabledTools.includes(id)) chatDisabledTools.push(id);
+              // 关掉工作流工具时同步熄掉 ✨ Ultracode：Ultracode 是强度下拉的最高一档，不允许「开关亮着但工具已禁」的矛盾
+              if (id === 'Workflow' && chatUltracode) {
+                chatUltracode = false;
+                persistPrefsToConv();
+                syncModelUI();
+              }
+            }
+            lsSet('claude_disabled_tools', JSON.stringify(chatDisabledTools));
+            saveUiPrefs();
+          });
+          builtinList.appendChild(row);
+        });
+
+        // MCP 服务器（用户自定义 + 内置）与内置 Skills：同一份全局开关（与设置页同源，写入对新会话生效）
+        if (mcpList) {
+          /** 回滚开关 UI（写入失败时把 checkbox 拨回去，change 事件会同步名称样式与 title） */
+          const rollback = (row, checked) => {
+            const inp = row.querySelector('input');
+            if (inp) { inp.checked = !checked; inp.dispatchEvent(new Event('change')); }
+          };
+          /** 写内置能力开关（PUT /api/builtins），失败弹 toast 并回滚 */
+          const putBuiltinRow = async (row, payload, checked, failMsg) => {
+            try {
+              const res = await fetch('/api/builtins', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+              });
+              if (!res.ok) throw new Error('server error');
+            } catch {
+              rollback(row, checked);
+              toast(failMsg);
+            }
+          };
+
+          let builtins = { mcp: [], skills: [] };
+          try {
+            const [userRes, builtinRes] = await Promise.all([fetch('/api/mcp-servers'), fetch('/api/builtins')]);
+            const dUser = await userRes.json();
+            const dBuiltin = await builtinRes.json().catch(() => ({}));
+            if (dBuiltin && typeof dBuiltin === 'object') builtins = { mcp: dBuiltin.mcp || [], skills: dBuiltin.skills || [] };
+            const servers = (dUser.servers || []).filter((s) => s && s.id);
+            const builtinMcp = Array.isArray(builtins.mcp) ? builtins.mcp : [];
+            mcpList.innerHTML = '';
+            if (mcpDivider) mcpDivider.hidden = servers.length + builtinMcp.length === 0;
+
+            // 内置 MCP（context7 / Figma 等）：标注「内置」与可用性提示，避免与用户自订项混淆
+            builtinMcp.forEach((m) => {
+              const hints = [];
+              if ((m.paths || []).length) hints.push((m.paths || []).join('/'));
+              if (m.available === false) hints.push('未检测到本地服务');
+              if (m.needsKey?.required && !m.hasKey) hints.push('缺密钥（设置页配置）');
+              const row = makeToolRow(
+                m.label || m.id,
+                '内置 MCP' + (hints.length ? ' · ' + hints.join(' · ') : ''),
+                !!m.enabled,
+                (checked) => putBuiltinRow(row, { kind: 'mcp', id: m.id, enabled: checked }, checked, '内置 MCP 状态更新失败'),
+              );
+              mcpList.appendChild(row);
+            });
+
+            // 用户自定义 MCP（既有行为不变）
+            servers.forEach((srv) => {
+              const row = makeToolRow(
+                srv.label || srv.command || srv.id,
+                'MCP: ' + (srv.command || srv.id),
+                srv.enabled !== false,
+                async (checked) => {
+                  try {
+                    const res = await fetch('/api/mcp-servers/' + encodeURIComponent(srv.id), {
+                      method: 'PUT',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({ enabled: checked }),
+                    });
+                    if (!res.ok) throw new Error('server error');
+                    srv.enabled = checked;
+                  } catch {
+                    rollback(row, checked);
+                    toast('MCP 服务器状态更新失败');
+                  }
+                },
+              );
+              mcpList.appendChild(row);
+            });
+          } catch {
+            if (mcpDivider) mcpDivider.hidden = true;
+          }
+
+          // 内置 Skills：包级开关（技能明细在设置页；未安装时置灰并给出安装提示）
+          // 技能机制仅 Claude 路径装配（openai 路径无 Skills）——自定义模型下整段隐藏，与工具列表同原则
+          const skillList = document.getElementById('skillToolsList');
+          const skillDivider = document.getElementById('skillToolsDivider');
+          if (skillList) {
+            const skills = Array.isArray(builtins.skills) ? builtins.skills : [];
+            skillList.innerHTML = '';
+            const skillsApply = chatProvider !== 'openai-compat';
+            if (skillDivider) skillDivider.hidden = !skillsApply || skills.length === 0;
+            if (skillsApply) {
+              skills.forEach((s) => {
+                const offCount = Array.isArray(s.skills) ? s.skills.filter((i) => !i.enabled).length : 0;
+                const hint = s.installed === false
+                  ? `未安装（${s.installHint || 'npm run setup:superpowers'}）`
+                  : offCount ? `已停用 ${offCount} 项` : '全部启用';
+                const row = makeToolRow(
+                  s.label || s.id,
+                  '内置技能包 · ' + hint,
+                  !!s.enabled,
+                  (checked) => putBuiltinRow(row, { kind: 'skill', id: s.id, enabled: checked }, checked, '内置技能状态更新失败'),
+                  { disabled: s.installed === false },
+                );
+                skillList.appendChild(row);
+              });
+            }
+          }
+        }
+      }
+      const MODEL_LABELS = {
+        auto: 'Auto',
+        'claude-fable-5-1': 'Fable 5.1',
+        'claude-opus-5': 'Opus 5',
+        'claude-sonnet-5': 'Sonnet 5',
+        'claude-haiku-5': 'Haiku 5',
+      };
+      const MODE_LABELS = {
+        default: '询问',
+        acceptEdits: '接受编辑',
+        plan: '计划',
+        bypassPermissions: '自动',
+      };
+      const MODES = ['default', 'acceptEdits', 'plan', 'bypassPermissions'];
+      const toolsFab = $('#toolsFab');
+      const toolsFabBtn = $('#toolsFabBtn');
+      const toolsPop = $('#toolsPop');
+      const modelBarBtn = $('#modelBarBtn');
+      const modelBarLabel = $('#modelBarLabel');
+      const modelPop = $('#modelPop');
+      const modelPills = $('#modelPills');
+      const customModelPills = $('#customModelPills');
+      const effortMenu = $('#effortMenu');
+      const effortBarBtn = $('#effortBarBtn');
+      const effortBarLabel = $('#effortBarLabel');
+      const effortPop = $('#effortPop');
+      const effortSlider = $('#effortSlider');
+      const effortValue = $('#effortValue');
+      const effortDescText = $('#effortDesc');
+      const effortTicks = $('#effortTicks');
+      /** Ultracode 的 meteors 特效层：随机参数照抄 inspira-ui 参考实现（延迟 0.2~1s、时长 2~10s），
+       *  方向 = 斜 35° 坠落（参考实现的 rotate(215deg) = 180° + 35°：向右下方飞、拖尾留在左上方）
+       *  ——角度与拖尾/圆头样式见 app.css 的 @keyframes meteor-h 与 .effort-meteors。 */
+      function buildEffortMeteors() {
+        const box = document.getElementById('effortMeteors');
+        if (!box || box.childElementCount) return;
+        for (let i = 0; i < 14; i++) {
+          const s = document.createElement('i');
+          // 起点铺在面板左上**外侧**：35° 斜落要横穿整块面板，从左上角进才看得见全程
+          s.style.top = Math.floor(Math.random() * 40) - 40 + '%'; // -40% ~ 0%：面板上沿之上
+          s.style.left = Math.floor(Math.random() * 120) - 140 + 'px'; // -140 ~ -20px：面板左沿之外
+          s.style.setProperty('--delay', (Math.random() * 0.8 + 0.2).toFixed(2) + 's');
+          s.style.setProperty('--dur', (Math.random() * 8 + 2).toFixed(2) + 's');
+          s.style.setProperty('--travel', Math.floor(Math.random() * 180) + 380 + 'px'); // 斜向：行程要比面板宽
+          box.appendChild(s);
+        }
+      }
+      buildEffortMeteors(); // 一次铺好，之后只靠 .ultra 切 display，不重造 DOM
+      const modeBarBtn = $('#modeBarBtn');
+      const modeBarLabel = $('#modeBarLabel');
+      const modePop = $('#modePop');
+      /** 自定义凭证列表缓存（启动 / 模型弹层打开 / 还原自定义会话时刷新）；null = 未知（没取过或取失败） */
+      let customCredsCache = null;
+      /** 档位元数据未知时的自动补拉次数（每秒级抖动不该让强度控件一直空着；见 scheduleCredsRetry） */
+      const CREDS_RETRY_MAX = 3;
+      let credsRetryLeft = CREDS_RETRY_MAX;
+      let credsRetryTimer = null;
+
+      if (!MODEL_LABELS[chatModel]) chatModel = 'auto';
+      // 初始归一：Claude 档位白名单；自定义模型的档位等凭证缓存回来后由 normalizeEffortForCurrent 再校
+      if (chatProvider !== 'openai-compat' && !EFFORTS.includes(chatEffort)) chatEffort = 'medium';
+      if (!MODES.includes(chatMode)) chatMode = 'default';
+
+      /** 取缓存里的当前自定义凭证（无缓存/未选 → null） */
+      function currentCustomEntry() {
+        if (chatProvider !== 'openai-compat' || !Array.isArray(customCredsCache)) return null;
+        return customCredsCache.find((c) => c.id === chatCustomCredId) || null;
+      }
+
+      /** 当前自定义模型的 effort 元数据；null = 未知（缓存未回/凭证不在），[] = 明确无档位 */
+      function currentModelEfforts() {
+        const entry = currentCustomEntry();
+        if (!entry) return null;
+        const m = Array.isArray(entry.models) ? entry.models.find((x) => x.id === chatCustomModel) : null;
+        return m && Array.isArray(m.efforts) ? m.efforts : [];
+      }
+
+      /** 当前自定义模型的上下文窗口（凭证元数据里的 context_window；未知 → null，只报 tokens 不算百分比） */
+      function currentModelContextWindow() {
+        const entry = currentCustomEntry();
+        const m = entry && Array.isArray(entry.models) ? entry.models.find((x) => x.id === chatCustomModel) : null;
+        const win = Math.floor(Number(m && m.contextWindow));
+        return Number.isFinite(win) && win > 0 ? win : null;
+      }
+
+      /** 顶栏「上下文使用率」渲染（自定义模型专属；Claude 的上下文由 SDK 自动压缩，不在此显示）。
+       *  数据源 = 当前会话记录里的最近一次模型用量（SSE usage 落下的），窗口优先用**当前所选模型**的：
+       *  用户刚换过模型时，记录里那个窗口是上一个模型的，拿它当分母会算出误导性的百分比。 */
+      function renderContextUsage() {
+        if (!contextProgress) return;
+        if (chatProvider !== 'openai-compat') return contextProgress.clearContextUsage();
+        const c = currentConvId ? loadConvs().find((x) => x.id === currentConvId) : null;
+        const rec = c && c.contextUsage ? c.contextUsage : null;
+        if (!rec) return contextProgress.clearContextUsage();
+        contextProgress.updateContextUsage({
+          ...rec,
+          contextWindow: currentModelContextWindow() || rec.contextWindow,
+        });
+      }
+
+      /** 自定义模型档位归一：当前值非法 → defaultEffort/第一档；无档位模型不动（发送时也不带） */
+      function normalizeEffortForCurrent() {
+        if (chatProvider !== 'openai-compat') return;
+        const entry = currentCustomEntry();
+        const m = entry && Array.isArray(entry.models) ? entry.models.find((x) => x.id === chatCustomModel) : null;
+        const next = pickEffort({
+          provider: 'openai-compat',
+          efforts: m && Array.isArray(m.efforts) ? m.efforts : [],
+          defaultEffort: m && typeof m.defaultEffort === 'string' ? m.defaultEffort : '',
+          current: chatEffort,
+        });
+        if (next && next !== chatEffort) {
+          chatEffort = next;
+          lsSet('claude_effort', chatEffort);
+        }
+      }
+
+      /** 拉自定义凭证列表（缓存）；force=true 强制重取（模型弹层打开时）。
+       *  失败**不写缓存**：写空数组等于把「没取到」当成「没有凭证」，之后所有调用都命中这个假结果，
+       *  强度控件就永远停在「—」直到用户手动打开一次模型弹层（用户报的「默认是空的，开一次模型选择才有值」）。 */
+      async function ensureCustomCreds(force = false) {
+        if (!force && Array.isArray(customCredsCache)) return customCredsCache;
+        try {
+          const r = await fetch('/api/credentials');
+          if (!r.ok) throw new Error('HTTP ' + r.status); // 5xx/401 不是「没有凭证」，不能污染缓存
+          const d = await r.json();
+          if (Array.isArray(d.credentials)) {
+            customCredsCache = d.credentials;
+            credsRetryLeft = CREDS_RETRY_MAX;
+          }
+        } catch {
+          /* 保持上一次的结果（可能是 null = 未知）：留给下一次调用重试 */
+        }
+        return customCredsCache;
+      }
+
+      /** 校准当前自定义凭证归属：命中 / 唯一认领 → 落回 chatCustomCredId；认不到 → 回落 Claude。
+       *  判据在 effort.logic.js#rehomeCustomCred（纯函数 + 单测）。
+       *  **必须与「打开模型弹层」同源共用**：只在弹层里认领的话，启动后强度控件会一直显示「—」，
+       *  用户得先点开一次模型选择才看到档位（默认空、开一次才有值的根因）。 */
+      function reconcileCustomCred() {
+        if (chatProvider !== 'openai-compat') return;
+        // 凭证列表没取到（null）时什么都不做：「不知道」不等于「没有」，
+        // 否则一次网络抖动就会把好好的自定义会话踢回 Claude。
+        if (!Array.isArray(customCredsCache)) return;
+        const home = rehomeCustomCred({ creds: customCredsCache, credId: chatCustomCredId, model: chatCustomModel });
+        if (!home) {
+          // 在用的凭证已被删除（或模型已不在任何凭证里）→ 回退 Claude，避免继续发送指向已删凭证的请求。
+          // 按 id 判定：同名 model 的另一条凭证还在，不代表**这一条**还在，
+          // 按 model 匹配会让删除后的选择静默漂移到另一个账号上。
+          chatProvider = 'claude-agent';
+          chatCustomCredId = '';
+          lsSet('claude_provider', chatProvider);
+          lsSet('claude_custom_cred_id', '');
+          persistPrefsToConv();
+          return;
+        }
+        if (home.id !== chatCustomCredId) {
+          chatCustomCredId = home.id;
+          lsSet('claude_custom_cred_id', chatCustomCredId);
+          persistPrefsToConv();
+        }
+      }
+
+      /** 启动 / 还原自定义会话后拉一次凭证：认领归属 → 归一强度档位 → 刷 UI。
+       *  认领这一步不能省：老会话的 credId 会被 applySessionPrefs 清空（缺字段视为没选过），
+       *  不在这里按 model 认回来，档位元数据就查不到，强度控件只能是空的。 */
+      async function refreshCredsForEffort() {
+        await ensureCustomCreds();
+        reconcileCustomCred();
+        normalizeEffortForCurrent();
+        syncModelUI();
+      }
+
+      /** 发送时实际带的 effort：自定义模型只有确认有档位才带值（无元数据模型不带，避免别家端点困惑） */
+      function runEffortForCurrent() {
+        if (chatProvider !== 'openai-compat') return chatEffort;
+        const list = currentModelEfforts();
+        return list && list.length ? chatEffort : '';
+      }
+
+      /** 强度档位兜底归一（发送前防线）：自定义模型值必须 ∈ none+efforts；Claude 非白名单回落 medium。
+       *  老 UI 遗留的 xhigh 等非法值从这里被纠正。
+       *  注意：Ultracode 不在这里被关——它对自定义模型已经可用（capabilities/workflow.logic.js），
+       *  工具被禁用的矛盾由 canEnableUltracode 在落档那一刻拦。 */
+      function ensureEffortValid() {
+        if (chatProvider === 'openai-compat') {
+          const list = currentModelEfforts();
+          if (list && list.length && ![EFFORT_OFF, ...list].includes(chatEffort)) {
+            normalizeEffortForCurrent();
+          }
+        } else if (!EFFORTS.includes(chatEffort)) {
+          chatEffort = 'medium';
+          lsSet('claude_effort', chatEffort);
+        }
+      }
+
+      /** 档位元数据未知（自定义模型 + 凭证还没回来）：自动补拉几次。
+       *  没有它的话，启动那一次请求抖一下，强度控件就永远是空的「—」，非得用户去点开模型选择才回填。 */
+      function scheduleCredsRetry() {
+        if (credsRetryLeft <= 0 || credsRetryTimer) return;
+        credsRetryLeft--;
+        credsRetryTimer = setTimeout(() => {
+          credsRetryTimer = null;
+          refreshCredsForEffort();
+        }, 1500);
+      }
+
+      /** 强度控件刷新：chip 标签 + 面板里的滑块/刻度（档位 = 当前模型 options：
+       *  自定义 none→…→max→Ultracode；Claude low→…→max→Ultracode） */
+      function syncEffortUI() {
+        const isAuto = chatProvider !== 'openai-compat' && chatModel === 'auto';
+        const isCustom = chatProvider === 'openai-compat';
+        const opts = effortOptions({ provider: chatProvider, efforts: currentModelEfforts() || [] });
+        // 自定义模型的档位元数据要等凭证列表回来才知道：null = 还不知道（不是「不支持」）
+        const metaKnown = !isCustom || currentModelEfforts() !== null;
+        if (!metaKnown) scheduleCredsRetry();
+        // metaKnown 参与 enabled：元数据未回来时控件先别可动（否则「加载中」会被当成「已选默认」）
+        const enabled = !isAuto && metaKnown && opts.length > 0;
+        const active = chatUltracode ? ULTRACODE : chatEffort;
+        // 自定义模型可能一档都没有（只剩 Ultracode）：那时 chip 显示「默认」——
+        // 表示不指定思考档位，而不是控件坏了
+        const activeLabel = active ? effortLabel(active) : '默认';
+        const idx = Math.max(0, opts.indexOf(active));
+        if (enabled) {
+          effortSlider.min = '0';
+          effortSlider.max = String(Math.max(0, opts.length - 1));
+          effortSlider.value = String(idx);
+        }
+        effortSlider.disabled = !enabled;
+        effortBarBtn.disabled = !enabled;
+        // Ultracode 档：chip 发光 + 面板落流星（CSS 动画，见 app.css）；两个 provider 都一样
+        const ultra = enabled && chatUltracode;
+        effortMenu.classList.toggle('ultra', ultra);
+        effortPop.classList.toggle('ultra', ultra);
+        effortBarLabel.textContent = isAuto
+          ? '强度 · Auto'
+          : !metaKnown
+            ? '强度 · …' // 档位还在路上（一两秒内自愈），别显示成「不支持」，也别先显示成一个默认值
+            : enabled
+              ? '强度 · ' + activeLabel
+              : '强度 · —';
+        effortValue.textContent = activeLabel;
+        effortDescText.textContent = enabled ? effortDesc(active) : '';
+        renderEffortTicks(opts, idx);
+        // 可用时不挂原生 title（自绘面板已经说明一切，原生气泡只会打架）；只有置灰态才用 title 解释原因
+        effortBarBtn.title = isAuto
+          ? 'Auto 模式下强度由分类器决定'
+          : enabled
+            ? ''
+            : metaKnown
+              ? '该模型不支持强度选择'
+              : '正在读取该模型的强度档位…';
+        effortBarBtn.setAttribute('aria-expanded', String(!effortPop.hidden));
+      }
+
+      /** 刻度条：逐个档位名（点一下跳档；守卫与滑块共用 onEffortSliderInput） */
+      function renderEffortTicks(opts, activeIdx) {
+        const sig = opts.join('|');
+        if (effortTicks.dataset.sig !== sig) {
+          effortTicks.dataset.sig = sig;
+          effortTicks.innerHTML = '';
+          const n = opts.length;
+          opts.forEach((v, i) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'effort-tick';
+            b.dataset.effort = v;
+            b.textContent = effortTickLabel(v);
+            b.title = v === ULTRACODE ? 'Ultracode · 多智能体编排' : effortLabel(v) + (effortDesc(v) ? '：' + effortDesc(v) : '');
+            // 首尾贴边、中间居中到滑块行程上（拇指 14px → 行程两端各内缩 7px）
+            if (i === 0) b.style.left = '7px';
+            else if (i === n - 1) b.style.right = '7px';
+            else {
+              b.style.left = `calc(7px + (100% - 14px) * ${i / (n - 1)})`;
+              b.style.transform = 'translateX(-50%)';
+            }
+            b.addEventListener('click', (e) => {
+              e.stopPropagation();
+              effortSlider.value = String(i);
+              if (onEffortSliderInput()) commitEffort();
+            });
+            effortTicks.appendChild(b);
+          });
+        }
+        [...effortTicks.children].forEach((b, i) => {
+          b.classList.toggle('active', i === activeIdx);
+          // 选不到的档（「工作流」工具被禁）留着但褪色：点了会 toast 解释
+          b.classList.toggle('blocked', b.dataset.effort === ULTRACODE && !canEnableUltracode(chatDisabledTools));
+        });
+      }
+
+      /** 滑块位置 → 档位值（每次现算：档位随模型/provider 变化） */
+      function effortStopAt(i) {
+        const opts = effortOptions({ provider: chatProvider, efforts: currentModelEfforts() || [] });
+        return opts[i] || '';
+      }
+
+      /** 滑到某档：非法（Ultracode 不可达）回弹并解释；@returns 是否落档成功 */
+      function onEffortSliderInput() {
+        const v = effortStopAt(Number(effortSlider.value));
+        if (!v) return false;
+        if (v === ULTRACODE && !canEnableUltracode(chatDisabledTools)) {
+          toast('「工作流」工具已禁用，先在「🔧 工具」里开启');
+          syncEffortUI(); // 回弹到合法档位
+          return false;
+        }
+        const applied = applyEffortChoice(v);
+        chatUltracode = applied.ultracode;
+        // Claude：Ultracode 同时把强度顶到「极高」（applyEffortChoice 的约定）。
+        // 自定义模型：Ultracode 只是开编排，**保持**用户选的厂商档位——各家档位名与语义自拟，
+        // 把它硬映射到某一档是猜；用户在编排期间自己滑档也随时生效。
+        const custom = chatProvider === 'openai-compat';
+        chatEffort = applied.ultracode && custom ? chatEffort : applied.effort;
+        lsSet('claude_effort', chatEffort);
+        persistPrefsToConv();
+        syncEffortUI(); // 立即反映 chip 标签与流光
+        return true;
+      }
+
+      /** 落档收尾：持久化 + 运行中提示（滑块释放 / 刻度点击共用） */
+      function commitEffort() {
+        if (chatProvider !== 'openai-compat') saveUiPrefs(); // 自定义档位随模型走，不写全局默认
+        if (currentConvId && runningJobs[currentConvId]) {
+          toast(chatUltracode ? '编排将从下一条新消息生效，插话不带 ultracode' : '思考强度将从下一条消息生效');
+        } else if (chatUltracode) {
+          toast('Ultracode 已开启（多智能体编排）');
+        }
+      }
+
+      /** 打开强度面板前刷一次：档位可能刚随模型变化；凭证还没回来时顺手补拉一次（否则是空的） */
+      function refreshEffortOnOpen() {
+        if (chatProvider === 'openai-compat' && currentModelEfforts() === null) refreshCredsForEffort();
+        syncEffortUI();
+      }
+
+      /** 关闭下拉开面板（except 指定保留者） */
+      function closeBarMenus(except) {
+        for (const pop of [modelPop, modePop, effortPop]) {
+          if (pop === except) continue;
+          pop.hidden = true;
+        }
+        effortBarBtn.setAttribute('aria-expanded', String(!effortPop.hidden));
+      }
+
+      /** 点 trigger 开关某个下拉（打开时回调 onOpen，如刷新数据/重建内容） */
+      function toggleBarMenu(pop, onOpen) {
+        const opening = pop.hidden;
+        closeBarMenus();
+        pop.hidden = !opening;
+        if (opening && onOpen) onOpen();
+      }
+
+      function syncModelUI() {
+        ensureEffortValid(); // 发送前防线：老 UI/旧会话带回的非法档位（如 xhigh）在渲染前被纠正
+        if (chatProvider === 'openai-compat') {
+          modelBarLabel.textContent = chatCustomLabel || chatCustomModel || '自定义模型';
+          [...modelPills.children].forEach((b) => b.classList.remove('active'));
+          // 按 cid + model 双匹配高亮：同凭证换模型、多凭证同模型都能区分（一凭证多 pill）
+          customModelPills.querySelectorAll('button[data-cid]').forEach((b) =>
+            b.classList.toggle('active', b.dataset.cid === chatCustomCredId && b.dataset.m === chatCustomModel),
+          );
+        } else {
+          modelBarLabel.textContent = MODEL_LABELS[chatModel];
+          [...modelPills.children].forEach((b) => b.classList.toggle('active', b.dataset.m === chatModel));
+          customModelPills.querySelectorAll('button').forEach((b) => b.classList.remove('active'));
+        }
+        syncEffortUI();
+        renderContextUsage(); // 会话 / 模型 / provider 变化都要重算顶栏那格（窗口是当前模型的）
+        modeBarLabel.textContent = MODE_LABELS[chatMode];
+        modePop.querySelectorAll('.pop-item').forEach((b) => b.classList.toggle('active', b.dataset.mode === chatMode));
+      }
+
+      // 打开弹层时拉取已配置的自定义模型，按凭证分组动态填充 pills（OpenCode 式：凭证 → 模型列表）
+      async function refreshCustomModelPills() {
+        try {
+          // 取数与缓存口径统一走 ensureCustomCreds（force：弹层打开时强制刷新）
+          const creds = await ensureCustomCreds(true);
+          if (!Array.isArray(creds)) return; // 没取到：保留现有面板内容，也不做归属回退
+          customModelPills.innerHTML = '';
+          creds.forEach((c) => {
+            const group = document.createElement('div');
+            group.className = 'model-group';
+
+            const vendorLabel = c.vendor ? (VENDOR_PRESETS[c.vendor]?.label || c.vendor) : '';
+            const head = document.createElement('div');
+            head.className = 'model-group-head';
+            head.textContent = c.label || vendorLabel || '自定义模型';
+            head.title = c.baseURL || '';
+            group.appendChild(head);
+
+            const pills = document.createElement('div');
+            pills.className = 'model-pills';
+            const models = Array.isArray(c.models) ? c.models : [];
+            if (!models.length) {
+              // 未发现模型（添加时拉取失败 / 老凭证）：给一条手动刷新入口，不自动发网络
+              const b = document.createElement('button');
+              b.textContent = '刷新模型';
+              b.title = '从服务商获取可用模型列表';
+              b.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                b.disabled = true;
+                b.textContent = '获取中…';
+                try {
+                  const rr = await fetch('/api/credentials/' + encodeURIComponent(c.id) + '/refresh-models', { method: 'POST' });
+                  const dd = await rr.json();
+                  if (!rr.ok || dd.error) toast(dd.error || '获取失败');
+                  else toast(`已获取 ${(dd.models || []).length} 个模型`);
+                } catch {
+                  toast('网络错误');
+                }
+                await refreshCustomModelPills();
+              });
+              pills.appendChild(b);
+            } else {
+              models.forEach((m) => {
+                const b = document.createElement('button');
+                b.dataset.m = m.id;
+                b.dataset.cid = c.id; // 高亮与发送都认 id：同模型的多条凭证（不同 key/厂商）才区分得开
+                b.textContent = m.name || m.id;
+                b.title = (c.label ? c.label + ' · ' : '') + m.id;
+                b.addEventListener('click', () => {
+                  chatProvider = 'openai-compat';
+                  chatCustomModel = m.id;
+                  chatCustomLabel = m.name || m.id;
+                  chatCustomCredId = c.id;
+                  // 切到自定义模型的瞬间就按该模型档位归一：老 localStorage 里的 xhigh 等非法值
+                  // 不能带进请求（2026-10-08 事故：DeepSeek 收到 reasoning_effort=xhigh）
+                  normalizeEffortForCurrent();
+                  lsSet('claude_provider', chatProvider);
+                  lsSet('claude_custom_model', chatCustomModel);
+                  lsSet('claude_custom_label', chatCustomLabel);
+                  lsSet('claude_custom_cred_id', chatCustomCredId);
+                  syncModelUI();
+                  persistPrefsToConv();
+                  modelPop.hidden = true;
+                  if (currentConvId && runningJobs[currentConvId]) toast('模型将从下一条消息生效');
+                });
+                pills.appendChild(b);
+              });
+            }
+            group.appendChild(pills);
+            customModelPills.appendChild(group);
+          });
+          // 归属校准与启动 / 还原会话共用一套（rehomeCustomCred）：凭证被删 → 回退 Claude；
+          // 老用户没存过 credId（升级路径）→ 按所选模型唯一认领一次，不至于一升级就被踢回 Claude。
+          reconcileCustomCred();
+          const divider = $('#customDivider');
+          if (divider) divider.hidden = creds.length === 0;
+          normalizeEffortForCurrent(); // 档位元数据随凭证列表回来，校一次当前值
+          syncModelUI();
+        } catch {
+          /* 忽略：拉取失败不影响 Claude 选择 */
+        }
+      }
+      syncModelUI();
+      if (chatProvider === 'openai-compat') refreshCredsForEffort(); // 启动即自定义会话：拉档位元数据
+      // 会话级偏好还原：仅接受白名单内的值（未知模型/模式一律忽略），实际变化才刷 UI + 提示
+      function applySessionPrefs(prefs) {
+        let changed = false;
+        // 自定义模型（openai-compat）不在 MODEL_LABELS 白名单，单独还原；缺 provider 字段视为 Claude 会话
+        const nextProvider = prefs.provider === 'openai-compat' ? 'openai-compat' : 'claude-agent';
+        if (nextProvider !== chatProvider) {
+          chatProvider = nextProvider;
+          lsSet('claude_provider', chatProvider);
+          changed = true;
+        }
+        if (chatProvider === 'openai-compat') {
+          if (prefs.customModel && prefs.customModel !== chatCustomModel) {
+            chatCustomModel = prefs.customModel;
+            lsSet('claude_custom_model', chatCustomModel);
+            changed = true;
+          }
+          if (prefs.customLabel && prefs.customLabel !== chatCustomLabel) {
+            chatCustomLabel = prefs.customLabel;
+            lsSet('claude_custom_label', chatCustomLabel);
+          }
+          // 凭证归属随会话还原。老会话没存过 customCredId：置空而非保留当前值——
+          // 留着上一个会话的 id 会让这条会话拿别人的 key 发请求，比退化成
+          // 服务端 pickActive 兜底更糟（后者至少是个确定行为，且会按 model 找）。
+          const nextCredId = prefs.customCredId || '';
+          if (nextCredId !== chatCustomCredId) {
+            chatCustomCredId = nextCredId;
+            lsSet('claude_custom_cred_id', chatCustomCredId);
+          }
+        }
+        if (prefs.model && MODEL_LABELS[prefs.model] && prefs.model !== chatModel) {
+          chatModel = prefs.model;
+          lsSet('claude_model', chatModel);
+          changed = true;
+        }
+        if (prefs.effort && prefs.effort !== chatEffort) {
+          // 自定义模型：缓存未回时乐观接受（refreshCredsForEffort 会再校）；有元数据时按档位集合校验
+          const list = chatProvider === 'openai-compat' ? currentModelEfforts() : null;
+          const valid =
+            chatProvider === 'openai-compat'
+              ? list === null || (list.length > 0 && [EFFORT_OFF, ...list].includes(prefs.effort))
+              : EFFORTS.includes(prefs.effort);
+          if (valid) {
+            chatEffort = prefs.effort;
+            lsSet('claude_effort', chatEffort);
+            changed = true;
+          }
+        }
+        if (prefs.mode && MODES.includes(prefs.mode) && prefs.mode !== chatMode) {
+          chatMode = prefs.mode;
+          lsSet('claude_mode', chatMode);
+          changed = true;
+        }
+        // ultracode 是会话级开关：缺字段视为关（老会话天然为关），不参与 changed 的 toast
+        const nextUltracode = !!prefs.ultracode && canEnableUltracode(chatDisabledTools); // 工具已全局禁用时不还原亮灯，与点击时的守卫对称
+        if (nextUltracode !== chatUltracode) {
+          chatUltracode = nextUltracode;
+          syncModelUI(); // 合并进强度档位后，Ultracode 状态反映在强度控件标签上
+        }
+        // 同款会话级开关，缺字段视为关；不参与 changed 的 toast
+        const nextFigmaRestore = !!prefs.figmaRestore;
+        if (nextFigmaRestore !== chatFigmaRestore) {
+          chatFigmaRestore = nextFigmaRestore;
+          syncFigmaRestoreBtn();
+        }
+        if (changed) {
+          syncModelUI();
+          const lbl =
+            chatProvider === 'openai-compat'
+              ? chatCustomLabel || chatCustomModel || '自定义模型'
+              : MODEL_LABELS[chatModel] + ' · ' + MODE_LABELS[chatMode];
+          toast('已还原此会话偏好：' + lbl);
+        }
+        // 飞书通知开关是会话级偏好（存 conv.meta.notifyFeishu），随其它偏好一起还原按钮态
+        if (window.__convNotify) window.__convNotify.refreshBtn(prefs);
+        // 自定义会话：凭证缓存回来后校验/归一强度档位（此时才知道该模型支持哪些档）
+        if (chatProvider === 'openai-compat') refreshCredsForEffort();
+      }
+      toolsFabBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toolsPop.hidden = !toolsPop.hidden;
+        if (!toolsPop.hidden) refreshToolsSection();
+      });
+      modelBarBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleBarMenu(modelPop, refreshCustomModelPills);
+      });
+      effortSlider.addEventListener('input', onEffortSliderInput);
+      effortSlider.addEventListener('change', () => {
+        // 非法档（Ultracode 不可达）已在 input 里回弹并 toast，这里不重复提示
+        if (onEffortSliderInput()) commitEffort();
+      });
+      // 强度面板与模型 / 权限同款：**点击**开合（不再 hover 弹出），点外部或按 Esc 收起
+      effortBarBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleBarMenu(effortPop, refreshEffortOnOpen);
+        effortBarBtn.setAttribute('aria-expanded', String(!effortPop.hidden)); // toggle 后同步（关的那一下 syncEffortUI 不会再跑）
+      });
+      effortMenu.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape' || effortPop.hidden) return;
+        e.stopPropagation();
+        closeBarMenus();
+        effortBarBtn.focus();
+      });
+      modeBarBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleBarMenu(modePop);
+      });
+      // 点击外部：三个下拉开面板与工具弹层一起收起
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.bar-menu')) closeBarMenus();
+        if (!toolsPop.hidden && !toolsFab.contains(e.target)) toolsPop.hidden = true;
+      });
+      const figmaRestoreBtn = $('#figmaRestoreBtn');
+      // 用 setIconText 而非 innerHTML：项目统一的图标注入方式（会裹一层 .inline-ic 做对齐）
+      if (figmaRestoreBtn) setIconText(figmaRestoreBtn, FIGMA_RESTORE_ICON_SVG);
+      /** 设计稿精确还原按钮：亮/灭态跟会话级状态；aria-pressed 同步，键盘与读屏可感知 */
+      function syncFigmaRestoreBtn() {
+        if (!figmaRestoreBtn) return;
+        figmaRestoreBtn.classList.toggle('on', chatFigmaRestore);
+        figmaRestoreBtn.setAttribute('aria-pressed', String(chatFigmaRestore));
+      }
+      syncFigmaRestoreBtn();
+      figmaRestoreBtn?.addEventListener('click', () => {
+        chatFigmaRestore = !chatFigmaRestore;
+        persistPrefsToConv(); // 无会话时 no-op，首条消息由 recordMessage 快照带入
+        syncFigmaRestoreBtn();
+        // 不调 saveUiPrefs：会话级偏好，不进服务端全局默认（同 ultracode）
+        if (chatFigmaRestore) toast('设计稿还原已开启：发送含 Figma 链接的消息即自动触发');
+      });
+      [...modelPills.children].forEach((b) => {
+        b.addEventListener('click', () => {
+          if (b.dataset.m === chatModel && chatProvider === 'claude-agent') return; // 重复点当前：不触发
+          chatModel = b.dataset.m;
+          chatProvider = 'claude-agent'; // 从自定义切回 Claude
+          lsSet('claude_model', chatModel);
+          lsSet('claude_provider', chatProvider);
+          saveUiPrefs(); // 同步到服务端配置
+          syncModelUI();
+          persistPrefsToConv();
+          if (currentConvId && runningJobs[currentConvId]) toast('模型将从下一条消息生效');
+        });
+      });
+      [...modePop.querySelectorAll('.pop-item')].forEach((b) => {
+        b.addEventListener('click', async () => {
+          const mode = b.dataset.mode;
+          closeBarMenus();
+          if (mode === chatMode) return; // 重复点当前模式：不发多余请求、不弹误导提示
+          chatMode = mode;
+          lsSet('claude_mode', chatMode);
+          saveUiPrefs(); // 同步到服务端配置
+          syncModelUI();
+          persistPrefsToConv();
+          // 运行中任务：尝试即时切换（Claude 仅「询问」起跑可放宽为 接受编辑/自动；openai 四档可切、
+          // 策略门实时读新档位，见 run-openai 的 createPolicyGate）
+          const job = currentConvId && runningJobs[currentConvId];
+          if (!job || !job.runId) return;
+          try {
+            const r = await fetch('/api/run/set-mode', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ runId: job.runId, mode }),
+            });
+            const d = await r.json();
+            toast(
+              d.applied
+                ? '当前任务已切换为「' + MODE_LABELS[mode] + '」'
+                : '当前任务无法中途切换，将从下一条消息生效',
+            );
+          } catch {
+            /* 网络失败不打扰：下一条消息仍会带上新模式 */
+          }
+        });
+      });
+      promptEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          send();
+        }
+      });
+      // 只有 Web 模式才绑 HTML5 拖拽。Tauri 原生拖拽接管后 dataTransfer.files 恒空，
+      // 这三个监听永不触发——留着就是下一批「看着有、实际从不执行」的死代码，
+      // 而本次要修的两个 bug 恰恰都是这么来的（tauri-init 那个 drag-drop 监听器同理）。
+      // Tauri 模式的拖拽走 drag-bus 总线，注册在本文件顶部。
+      //
+      // 判据用 __TAURI_INTERNALS__ 而非 window.tauriApi?.isTauri：本段是 chat.js 的模块顶层
+      // 同步代码，而 tauriApi 由 tauri-init.js 的异步 IIFE 在 `await import(vendor)` 之后才赋值
+      // （app.js 先 import tauri-init 再 import chat，IIFE 早已挂起）——此刻读必然是 undefined，
+      // 会被误判成 Web 模式。__TAURI_INTERNALS__ 是 Tauri v2 webview 里始终存在的同步全局量，
+      // 无时序问题（tauri-init.js 自己判 isTauri 用的也是它）。
+      if (typeof window.__TAURI_INTERNALS__ === 'undefined') {
+        promptEl.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          promptEl.classList.add('dragover');
+        });
+        promptEl.addEventListener('dragleave', (e) => {
+          if (!promptEl.contains(e.relatedTarget)) promptEl.classList.remove('dragover');
+        });
+        promptEl.addEventListener('drop', handleDrop);
+      }
+      $('#sidebarNew').addEventListener('click', newConversation);
+
+      // 会话列表右键菜单（事件委托到 convList）
+      $('#convList').addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        // 向上查找最近的 conv-item
+        const row = e.target.closest('.conv-item');
+        if (!row) return;
+        const convId = row.dataset.convId;
+        if (!convId) return; // 无 convId（理论上不会出现）不可操作
+        const isPinned = row.dataset.pinned === '1';
+        _showCtxMenu(e.clientX, e.clientY, convId, isPinned);
+      });
+
+      // 「📂 系统选择」的绑定已移入 dir-popover.js：它是弹层自己的控件，
+      // 绑在这里会绕过弹层的宿主指针，导致其它面板借用弹层时选完目录不回填。
+
+      // FAB 行 / 需求右栏随 composer 高度同步上移，composer 变高时 bottom 随之增大
+      {
+        const fabRow = document.getElementById('fabRow');
+        const composerEl = document.querySelector('.composer');
+        if (fabRow && composerEl) {
+          const syncFabBottom = () => {
+            const h = composerEl.offsetHeight;
+            fabRow.style.bottom = (h + 10) + 'px';
+            // 右栏（.req-rail）的 bottom 读 --composer-h：输入框长高（多行）时
+            // 右栏一起让位，否则会盖住 composer 右上角（发送按钮一侧）。
+            document.documentElement.style.setProperty('--composer-h', h + 'px');
+          };
+          // jsdom（单元测试环境）没有 ResizeObserver，生产是 Chromium webview 必然有。
+          // 同 req-chat.js 的 observeRailTop：退化为「只同步一次」，
+          // 不能让测试环境把 mount 整条链炸掉。
+          if (typeof ResizeObserver !== 'undefined') {
+            new ResizeObserver(syncFabBottom).observe(composerEl);
+          }
+          syncFabBottom(); // 初始同步一次
+        }
+      }
+
+
+
+      // ---- 额度用尽待续跑：轮询 + 等待横幅 + 续跑自动接流 ----
+      const pendingMap = {}; // convId -> { resetsAt, status, runId }
+      const handledResumes = new Set(); // 已接流的续跑 runId，避免重复
+      const handledAbandoned = new Set(); // 已展示过终结提示的熔断会话，避免重复
+      const handledFollowUps = new Set(); // P4：已接流的排空 follow-up runId，避免重复
+      // 异常重试后的提前轮询：pending 轮询周期是 15s，不提前拉的话「2 秒后自动重试」在用户
+      // 眼里会变成「最多 17 秒才见动静」。拉两次——第二次兜住 doResume 起跑稍慢/落盘稍晚的情况，
+      // 15s 周期仍是最终兜底。
+      function scheduleRetryPolls(retryInMs) {
+        const first = (Number(retryInMs) || 2000) + 800;
+        setTimeout(refreshPending, first);
+        setTimeout(refreshPending, first + 3000);
+      }
+      // 排队 follow-up 后的提前轮询：当前 run 的 done 一到就拉，尽快接上排空起的新 run
+      //（服务端在终结同一 tick 内即起跑新 run，500ms 足够；15s 周期兜底）。
+      function pollPendingSoon() {
+        setTimeout(refreshPending, 500);
+        setTimeout(refreshPending, 2000);
+      }
+      // 失效清除 / 熔断消费：请服务端按 convId 移除待续跑条目（不阻塞 UI）
+      function dismissPending(convId) {
+        if (!convId) return; // 防御：无 convId 不发请求（对齐 abortRun 模式）
+        fetch('/api/run/pending/dismiss', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ convId }),
+        }).catch(() => {});
+      }
+      function fmtResetTime(sec) {
+        try {
+          return new Date(sec * 1000).toLocaleTimeString('zh-CN', {
+            hour: '2-digit',
+            minute: '2-digit',
+          });
+        } catch {
+          return '';
+        }
+      }
+      function renderPendingBanner() {
+        const banner = $('#pendingBanner');
+        const p = currentConvId && pendingMap[currentConvId];
+        if (p && p.status === 'waiting') {
+          if (p.reason === 'exception_retry') {
+            setIconText(banner, REFRESH_ICON_SVG, '任务异常中断，正在自动重试…');
+          } else if (p.reason === 'orphan_recovery') {
+            setIconText(banner, REFRESH_ICON_SVG, '进程重启，任务自动续接中…');
+          } else {
+            // quota_exhausted 或默认情况
+            setIconText(banner, WAITING_ICON_SVG, `额度用尽，本任务将于 ${fmtResetTime(p.resetsAt)}（token 重置）后自动继续`);
+          }
+          banner.hidden = false;
+        } else {
+          banner.hidden = true;
+        }
+      }
+      async function refreshPending() {
+        let list;
+        let follows = [];
+        try {
+          const body = await (await fetch('/api/run/pending')).json();
+          list = body.pending;
+          follows = Array.isArray(body.followUps) ? body.followUps : []; // P4：busy inbox 排空记录
+        } catch {
+          return;
+        }
+        for (const k in pendingMap) delete pendingMap[k];
+        let waiting = 0;
+        for (const e of list || []) {
+          pendingMap[e.convId] = { resetsAt: e.resetsAt, status: e.status, runId: e.runId, reason: e.reason };
+          if (e.status === 'waiting') waiting++;
+          // 熔断：连续续跑/重试失败达上限 → 展示一次终结提示（仅当前会话）并 dismiss 移除
+          if (e.status === 'abandoned') {
+            if (!handledAbandoned.has(e.convId)) {
+              handledAbandoned.add(e.convId);
+              if (e.convId === currentConvId && !runningJobs[e.convId]) {
+                // 「重试」是覆盖三条路径的措辞：额度续跑、进程重启孤儿恢复、异常自动重试
+                const note =
+                  '⚠️ 连续 ' +
+                  (e.attempts || '多') +
+                  ' 次自动重试均未完成，已停止自动重试；如需继续请手动发送消息。';
+                const idx = convPushMessage(e.convId, 'assistant', note);
+                if (idx >= 0) addMessage('assistant', note);
+                scrollBottom();
+                renderConvListDebounced(); // 与 resuming 分支一致：终结提示后刷新左栏
+              }
+              dismissPending(e.convId);
+            }
+            continue;
+          }
+          // 续跑已开始 → 仅为「当前打开的会话」接流（隔离：不向他会话/新会话塞气泡）
+          if (
+            e.status === 'resuming' &&
+            e.runId &&
+            e.convId === currentConvId
+          ) {
+            const c = loadConvs().find((x) => x.id === e.convId);
+            if (c) {
+              // 如果是新 runId（前一个失败了），重新接流；如果已接过则跳过
+              if (!handledResumes.has(e.runId) && !runningJobs[e.convId]) {
+                handledResumes.add(e.runId);
+                const idx = convPushMessage(e.convId, 'assistant', '');
+                convSetMsgFields(e.convId, idx, { pending: true, runId: e.runId });
+                addMessage('assistant', '');
+                attachStream(e.convId, idx, e.runId);
+                renderConvListDebounced();
+              } else if (runningJobs[e.convId]) {
+                // 已有运行中的 job，但 runId 可能因 run 不存在而需要更新
+                // 检查该 job 是否是 pending 状态（run 不存在导致的静默等待）
+                const job = runningJobs[e.convId];
+                if (job.pending && job.runId !== e.runId) {
+                  // runId 变了（新续跑），切换接流
+                  job.runId = e.runId;
+                  job.pending = false; // 清除等待标志，重新接流正式开始
+                  handledResumes.add(e.runId);
+                  attachStream(e.convId, job.asstIndex, e.runId);
+                }
+              }
+            }
+          }
+        }
+        // busy inbox：排空起的新 run（队列被消费）→ 补用户消息上屏 + 接流 + 清卡片。
+        // 与 resuming 分支同策略：只管当前打开的会话（后台会话由 drainedFollowUps 记着，打开时补接）；
+        // runId 去重；已有 job 时不抢。
+        for (const f of follows) {
+          if (!f || !f.runId || !f.convId) continue;
+          if (handledFollowUps.has(f.runId)) continue;
+          if (f.convId !== currentConvId) {
+            drainedFollowUps[f.convId] = f; // 后台会话：打开时走 openConv 的补接流分支
+            continue;
+          }
+          const job = runningJobs[f.convId];
+          if (job) {
+            // 已有 job：仅当它正因「run 不存在」静默等待时切换（与 resuming 的更新分支同判据）
+            if (job.pending && job.runId !== f.runId) {
+              job.runId = f.runId;
+              job.pending = false;
+              handledFollowUps.add(f.runId);
+              attachStream(f.convId, job.asstIndex, f.runId);
+            }
+            continue;
+          }
+          const conv = loadConvs().find((x) => x.id === f.convId);
+          if (!conv) continue;
+          // 被排空的排队消息：优先用本地卡片/排空记录里的原文，在助手占位之前上屏为用户消息
+          const ids = Array.isArray(f.ids) ? f.ids : [];
+          const texts = Array.isArray(f.texts) ? f.texts : [];
+          const localItems = convQueues[f.convId] || loadConvQueue(f.convId);
+          for (let k = 0; k < ids.length; k++) {
+            const item = localItems.find((m) => m.id === ids[k]);
+            const text = (item && item.text) || texts[k] || '';
+            await deliverQueueItem(f.convId, { id: ids[k], text });
+            removeQueueItem(f.convId, ids[k]);
+          }
+          handledFollowUps.add(f.runId);
+          delete convFollowUpPending[f.convId]; // 已接上排空 run，本轮排队任务已有归属
+          const idx = convPushMessage(f.convId, 'assistant', '');
+          convSetMsgFields(f.convId, idx, { pending: true, runId: f.runId });
+          addMessage('assistant', '');
+          attachStream(f.convId, idx, f.runId);
+          renderConvListDebounced();
+        }
+        if (handledFollowUps.size > 200) handledFollowUps.clear(); // 防长期运行内存增长（GC 兜底）
+        const chip = $('#pendingChip');
+        chip.hidden = waiting === 0;
+        if (waiting) setIconText(chip, WAITING_ICON_SVG, `${waiting} 个任务待续跑`);
+        else chip.textContent = '';
+        renderPendingBanner();
+      }
+
+      // ---- 启动初始化（聊天相关行，迁自 app.js 启动节；顺序保持原样，由壳编排调用） ----
+      export function initChat() {
+      refreshDirLabel(); // 回填上次选择的工作目录（localStorage 快速渲染）
+      reinitializeGitSelector(); // 分支选择器首探：必须在此（闸门后）而非模块顶层，否则必踩后端冷启动
+      initUiPrefs();     // 异步从服务端同步偏好（跨重启恢复；覆盖 localStorage 默认值）
+      bindComposerDraft(persistDraftToConv); // 输入即写穿草稿到当前会话记录
+      renderConvList(); // 渲染左侧对话历史
+      // 刷新后自动回到上次打开的会话：运行中任务经 openConv 的 pending+runId 扫描自动重连。
+      // setTimeout(0)：openConv 依赖脚本尾部才初始化的 AnimeAnimations（const TDZ），须等本轮求值结束
+      {
+        // URL ?conv= 优先（跨项目点击/新窗定向）；否则回上次会话——但仅限属于本窗项目的会话（一窗一项目）
+        const target = _urlConv || localStorage.getItem('claude_last_conv');
+        const c = target ? loadConvs().find((x) => x.id === target) : null;
+        if (c && (_urlConv || (c.cwd || '') === (cwd || ''))) setTimeout(() => openConv(c.id), 0);
+        else restorePrompt(localStorage.getItem(NEW_DRAFT_KEY)); // 无会话可恢复：回填未落地的新对话草稿
+      }
+      refreshPending(); // 额度用尽待续跑轮询
+      setInterval(refreshPending, 15000);
+      }
+
+      /** 回聊天视图时吸底：display:none 会丢滚动位置，返回时恢复到底部（由壳的视图切换 chat 分支调用） */
+      export function chatOnShow() {
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+
+      // AnimeAnimations 初始化完成后补播空态吉祥物动画（脚本尾部定义，首帧时还不存在）
+      requestAnimationFrame(() => {
+        if (emptyEl && emptyEl.style.display !== 'none') {
+          AnimeAnimations.playVibeAnimation();
+        }
+      });
+
+      // 页面关闭前强制写 localStorage，防止防抖窗口内的数据丢失
+      window.addEventListener('beforeunload', flushConvs);
+
+      // ---- 导出：侧栏会话树查询运行状态灯 ----
+      export function isConvRunning(convId) {
+        return runningJobs[convId] ? true : false;
+      }
+
+      /** 当前会话 id 的只读出口。conv-notify 的开关/轮询必须**实时**取它：
+       *  localStorage 的 claude_last_conv 是多窗共享的，另开一个项目窗口就会被改写，
+       *  拿它当当前会话会让轮询盯错会话；而缓存一次同样不行。 */
+      export function getCurrentConvId() {
+        return currentConvId;
+      }
+
+      /** 本窗项目目录的只读出口（一窗一项目）。未提交变更面板按**项目**取数而不是按会话：
+       *  同一个目录下不管在哪个会话里，未提交的改动都是同一批，所以它必须实时取这个值。 */
+      export function getCwd() {
+        return cwd;
+      }
+
+      /**
+       * Task 5.4：后台发送消息，启动一次 run。
+       *
+       * @param {string} convId 会话 ID
+       * @param {string} text 真正发给模型的提示词（可能极长，如塞了 30KB 转录）
+       * @param {{displayText?: string}} [opts] displayText 给出时，会额外落一条用户消息，
+       *   内容用 displayText 而不是 text——调用方可以传一句简短的「[汇总 3/21] 会话《x》」，
+       *   既让用户看得见"这一步在干什么"，又不会把整份转录塞进气泡。
+       *   缺省（不传）时保持历来行为：不记用户消息。
+       *
+       *   ⚠️ 原实现只 convPushMessage 一条助手占位、从不建 DOM 气泡，并且把 job 传给
+       *   attachStream，正好绕过其内部唯一会补气泡 + paintJob + ensureTyping 的 `if (!job)`
+       *   分支 —— 结果是整个后台流程期间对话区一个字都不画（用户看到的「空对话」）。
+       *   现在：目标会话恰好是当前会话时，落库与上屏严格成对，维护
+       *   「存储索引 = DOM 索引 = _bubbleMap 索引」三方同序；不是当前会话则仍只落库
+       *  （DOM 不属于它，用户切回时 openConv 会整体重建并经本地 job 分支 paintJob）。
+       * @returns {Promise<void>} 返回已连接 SSE 的 Promise
+       */
+      export async function sendMessageBackground(convId, text, opts = {}) {
+        const list = loadConvs();
+        const conv = list.find(c => c.id === convId);
+        if (!conv) throw new Error(`Conv ${convId} not found`);
+        const isCurrent = convId === currentConvId; // 决定本次是否上屏（addMessage 只服务当前会话的 DOM）
+
+        // 创建 job 对象
+        const job = {
+          es: null,
+          asstIndex: -1,
+          convId: convId,
+          text: '',
+          shown: 0,
+          base: 0,
+          activities: [],
+          todos: [],
+          ask: null,
+          rev: 0,
+          err: false,
+          runId: null,
+        };
+
+        // 可选的用户消息：让「汇总了哪些内容」有迹可循（原实现连提示词都不落库，事后无从查证）
+        if (opts.displayText) {
+          convPushMessage(convId, 'user', opts.displayText);
+          if (isCurrent) await addMessage('user', opts.displayText); // 与上一行严格成对
+        }
+
+        // 助手占位
+        const asstIndex = convPushMessage(convId, 'assistant', '');
+        convSetMsgFields(convId, asstIndex, { pending: true });
+        if (isCurrent) await addMessage('assistant', ''); // 同上：成对，索引才对得齐
+        job.asstIndex = asstIndex;
+
+        // 注册为运行中的 job（防止多次重复启动）
+        runningJobs[convId] = job;
+        if (isCurrent) {
+          updateComposerRunning();
+          renderConvListDebounced();
+          paintJob(job);   // 立刻显示「运行中…」，不必等 start 往返
+          ensureTyping();  // 起打字机，后续 delta 才会逐字上屏
+        }
+
+        return new Promise((resolve, reject) => {
+          // 启动 run（与 send() 的 launchRun 流程一致）
+          const sessionId = conv.session || null;
+          const runCwd = cwd || '';
+          const effectiveMode = chatMode;
+          const startBody =
+            chatProvider === 'openai-compat'
+              ? { prompt: text, cwd: runCwd, session: sessionId, provider: 'openai-compat', model: chatCustomModel, credId: chatCustomCredId, convId, requestId: newRequestId(), mode: effectiveMode, effort: runEffortForCurrent(), ultracode: chatUltracode }
+              : { prompt: text, cwd: runCwd, session: sessionId, model: chatModel, effort: chatEffort, mode: effectiveMode, convId, requestId: newRequestId() };
+
+          fetch('/api/run/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(startBody),
+          })
+            .then((r) => r.json())
+            .then((d) => {
+              if (!d.runId) throw new Error(d.error || '启动失败');
+              job.runId = d.runId;
+              if (d.model) {
+                job.pickLabel = shortModel(d.model, d.effort);
+              }
+              convSetMsgFields(convId, job.asstIndex, { runId: d.runId });
+              // 接流（后台会话不显示）
+              attachStream(convId, job.asstIndex, d.runId, job);
+              // resolve：SSE 已连接并开始接收
+              resolve();
+            })
+            .catch((err) => {
+              job.text = '⚠️ ' + (err && err.message ? err.message : '启动失败');
+              job.err = true;
+              convSetMessage(convId, job.asstIndex, job.text);
+              convSetMsgFields(convId, job.asstIndex, { pending: false });
+              endJob(convId, true);
+              reject(err);
+            });
+        });
+      }

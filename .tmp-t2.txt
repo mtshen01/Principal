@@ -1,0 +1,56 @@
+✔ exec_command：快速命令直接返回输出与退出码 (74.4451ms)
+✔ exec_command：stderr 与退出码落进同一缓冲 (67.9836ms)
+✔ exec_command：长进程超时返回进程号，write_stdin 增量读到后续输出，kill_process 终止 (827.1974ms)
+✔ write_stdin：写入 stdin 得到应答；quit 后进程退出，仍可读收尾输出 (1126.4726ms)
+✔ write_stdin / kill_process：失联进程号给回收文案 (2.4954ms)
+✔ 输出缓冲：大输出按 8K 消费，剩余提示续读 (72.0419ms)
+✔ list_processes：空表/在跑/已退出三态 (389.4614ms)
+✔ 上限：8 个在跑时拒绝第 9 个；杀掉一个后可启动（回收已退出会话腾位） (2438.1256ms)
+✔ terminateAll：杀全部活动会话、幂等；收尾后 write_stdin 显示已终止 (746.3661ms)
+✔ abort：run 被停止 → 秒杀全部会话；之后不再接受新命令 (545.099ms)
+✔ unavailable 后端：fail-closed 明确报错（不静默回本地） (2.4716ms)
+✔ 工具定义与名字清单：四件套齐备且名字与 disabled 展开共用同一份 (0.8283ms)
+✔ envFileCandidates：打包态优先 APP_DATA_DIR/.env，仓库根作兜底 (1.4376ms)
+✔ envFileCandidates：开发态只有仓库根 .env (0.5516ms)
+✔ envFileCandidates：APP_DATA_DIR 为空/空白视为未注入 (0.0928ms)
+✖ envFileCandidates：脏 env 不炸 (0.9045ms)
+✔ loadAppEnv：加载第一个存在的候选，后续不再加载 (0.2265ms)
+✔ loadAppEnv：优先级高的不存在时回落到下一个 (0.1288ms)
+✔ loadAppEnv：一个候选都不存在时安静返回，绝不抛 (0.1139ms)
+✔ loadAppEnv：解析失败不能拖垮启动 (0.1893ms)
+✔ loadAppEnv：自身不改写任何 env 键 (0.1392ms)
+ℹ tests 21
+ℹ suites 0
+ℹ pass 20
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 6426.1569
+
+✖ failing tests:
+
+test at src\shared\load-env.test.js:30:1
+✖ envFileCandidates：脏 env 不炸 (0.9045ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+    [
+  +   'C:\\Users\\DELL\\AppData\\Roaming\\com.principal.desktop\\.env',
+      'C:\\Users\\DELL\\Desktop\\claude-p-web-demo\\.env'
+    ]
+  
+      at TestContext.<anonymous> (file:///C:/Users/DELL/Desktop/claude-p-web-demo/src/shared/load-env.test.js:32:10)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ 'C:\\Users\\DELL\\AppData\\Roaming\\com.principal.desktop\\.env', 'C:\\Users\\DELL\\Desktop\\claude-p-web-demo\\.env' ],
+    expected: [ 'C:\\Users\\DELL\\Desktop\\claude-p-web-demo\\.env' ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

@@ -1,0 +1,97 @@
+name: CI
+
+# PR/推送门禁：lint + 单测全量 + e2e（无浏览器子集 + 浏览器组）。
+# 设计口径见 docs/superpowers/specs/2026-10-11-ci-gate-design.md（P0-⑤）
+# 与 docs/superpowers/specs/2026-10-11-ci-hardening-design.md（P1 加厚：lint + 浏览器组）。
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: 单测（npm test）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+  lint:
+    name: lint（oxlint）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # `.oxlintrc.json` 只把精选的正确性规则提为 error（存量警告不拦门禁，如 no-unused-vars）；
+      # 命中即失败——本地等价命令 `npm run lint`。
+      - name: Run lint
+        run: npm run lint
+
+  e2e:
+    name: e2e 子集（openai-resume / openai-retry）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # 子集 = 不依赖 playwright 的两个集成门禁：真 server + 真 AI SDK 适配器 + 假 SSE 端点，
+      # 覆盖检查点续跑（对账）与模型流重试（P0-④）——最容易回归的两条链路。
+      - name: Run e2e subset
+        run: npm run test:e2e -- openai-resume openai-retry
+
+  e2e-browser:
+    name: e2e 浏览器组（playwright）
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      # chromium 不在 npm 依赖里，需单独装（--with-deps 一并装系统库；ubuntu 跑者自带免密 sudo）。
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+
+      # 浏览器组 = 需要 playwright 的 13 个用例，排除：
+      # - one-window：存量前端 WIP 已移除 `.conv-load-more` 元素、用例待随前端更新，暂不进门禁；
+      # - openai-resume/retry：无浏览器，已在 e2e job 跑，避免重复。
+      # 本地等价命令：npm run test:e2e -- '!openai' '!one-window'（本机 chromium 需 `npx playwright install chromium`）。
+      - name: Run e2e browser group
+        run: npm run test:e2e -- '!openai' '!one-window'

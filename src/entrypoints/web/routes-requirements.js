@@ -1,0 +1,1257 @@
+/** web 入口：需求工作流 HTTP 路由 —— 单入口 handleRequirementRoutes 按 pathname+method 分发 */
+import fs from 'node:fs';
+import { getRequirement, getRequirements, updateRequirement, createRequirement, deleteRequirement, canTransition, normalizeSessions } from '../../store/requirements.js';
+import { enqueueSystemTask, finalizeRequirement, finalizePrecheck, archiveRequirement, resolveAssigneeList, hasQueuedTasks, queuedTasks, reqDir, readMapVersion, DOCGEN_GUIDE, docgenAborts, userStoppedSet, docgenLiveLine, registerApiDoc } from './requirement-ops.js';
+import { pickCwdAndDirs, buildSeedPrompt, buildFeatureSnapshot, runningSessions } from './req-logic.js';
+import { getTopFiles, getFeatureIndex } from '../../store/feature-index.js';
+import { getColleague, getColleagues, ROLES } from '../../store/colleagues.js';
+import { getColleagueThread, markColleagueRead, appendTo, dropReqThreads, getUnreadTotals, listThreadSummaries } from '../../store/colleague-messages.js';
+import { getActions, isUndoable } from '../../store/agent-actions.js';
+import { getActiveBot, getPluginEnabled } from '../../store/settings.js';
+import { sendTextToUser, removeReactionWithCreds } from '../../integrations/lark.js';
+import { undoAgentAction } from './undo-agent-action.js';
+import { runScript } from '../../integrations/shell.js';
+import { writePitfalls, ensureClaudeMdRef } from './req-pitfalls.js';
+import { inspectBitable, confirmBug, ignoreBug, retryBug, currentInspectIdentity } from './req-inspect.js';
+import { parseBitableLink } from '../../plugins/team-tools/bug-patrol/logic.js';
+import { extractDocLinks } from '../../channels/feishu-normalize.js';
+import { fetchDocRawContent, resolveWikiNodeObj } from '../../integrations/lark.js';
+import { hasActiveRunForConv } from '../../store/runs.js';
+import { handleReqV2Routes } from './routes-req-v2.js';
+import { handleColleagueTurn } from '../../plugins/colleague-agent/session.js';
+import { handleColleagueAskReply, handleColleagueAskOption, confirmAskFromHost } from '../../capabilities/feishu-ask.js';
+import { sendJson } from './http-util.js';
+import { withJsonBody } from './body.js';
+import { str } from './input.js';
+import { logger } from '../../shared/logger.js';
+
+/**
+ * 新建需求的工程配置默认值：沿用最近一次新建的、配过工程的需求（含「开发 / 只读」标记）。
+ *
+ * 同一批需求几乎总落在同一套前后端工程上，每建一个需求都重走两次系统文件夹框是纯重复劳动。
+ *
+ * 按 createdAt 倒序而不是直接用 getRequirements 的 updatedAt 序：后者会被 busy 写入、会话
+ * 绑定、巡检回填等任何一次落盘刷新，回头动过的老需求会插到队首，「上一个需求」就名不副实。
+ *
+ * 目录已不存在的槽位跳过（两侧都不存在就继续往前找）：工程被挪走或删掉后继承一个坏路径，
+ * 界面上看不出任何异常，要等 docgen 报错才发现；宁可留空逼用户重选一次。
+ */
+function inheritProjects() {
+  const list = getRequirements().sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  for (const r of list) {
+    const picked = { frontend: null, backend: null };
+    for (const key of ['frontend', 'backend']) {
+      const p = r.projects?.[key];
+      if (p?.dir && fs.existsSync(p.dir)) picked[key] = { dir: p.dir, dev: !!p.dev };
+    }
+    if (picked.frontend || picked.backend) return picked;
+  }
+  return { frontend: null, backend: null };
+}
+
+// ==== POST /api/req/create ====
+function handleCreate(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const title = str(data.title);
+    if (!title) return sendJson(res, 400, { error: 'title 不能为空' });
+    if (title.length > 60) return sendJson(res, 400, { error: 'title 不能超过 60 字符' });
+    const created = createRequirement({ title, projects: inheritProjects() });
+    sendJson(res, 201, created);
+  });
+}
+
+// ==== GET /api/req/list ====
+function handleList(res) {
+  // 一次读盘算出全量未读，再按 id 取：逐需求调 getUnreadCounts 会在几十条需求上放大成几十次读盘
+  const unreadTotals = getUnreadTotals();
+  const requirements = getRequirements().map((r) => ({
+    id: r.id,
+    title: r.title,
+    phase: r.phase,
+    updatedAt: r.updatedAt,
+    // 排队中（泵尚未派发、busy 未写入）也算 busy：否则 docgen 202 后的短窗口里列表看不到任何进行中迹象
+    busy: !!r.busy || hasQueuedTasks(r.id),
+    // 同事未读总数：侧栏据此打小红点。不进需求就能看到「哪个需求有人找我」——
+    // 详情页右栏那个 badge 要点进需求才看得见，后端同事发来接口文档时主机常常整天没注意到
+    unreadTotal: unreadTotals[r.id] || 0,
+    // 会话树要靠它渲染。前端 refreshReqList 用本接口返回值整体替换 lastList，
+    // 少了这个字段，30s 轮询一到开发/测试期的子会话行就全部消失（看起来像「下拉自动收起」）。
+    sessions: normalizeSessions(r),
+  }));
+  sendJson(res, 200, { requirements });
+}
+
+// ==== GET /api/req/get?id= ====
+function handleGet(url, res) {
+  const id = str(url.searchParams.get('id'));
+  const r = getRequirement(id);
+  if (!r) return sendJson(res, 404, { error: '需求不存在' });
+  const latest = r.devDoc?.versions?.at(-1);
+  let devDocLatest = null;
+  if (latest) {
+    try {
+      devDocLatest = fs.readFileSync(latest.path, 'utf8');
+    } catch {
+      devDocLatest = null; // 文件被移动/删除等读取失败不炸接口，前端按「暂无」处理
+    }
+  }
+  // queued：任务已入队但泵（5s tick）还没派发、busy 尚未写入的窗口期。前端把它视同 busy，
+  // 否则 docgen 202 后立即刷新会拿到 busy=null——既不显示生成中，也不会启动 busy 轮询。
+  // devCwd：开发/系统任务所在的工程目录（pickCwdAndDirs 取第一个工程，与 dispatchSystemTask/runDocgen 同源）。
+  // 前端据此按 cwd 定位 Claude 磁盘会话（~/.claude/projects/<encode(cwd)>/<devSession>.jsonl），
+  // 用于「开发已完成、过程没进 localStorage」时从 session 转录回放开发过程。
+  const featureSnapshot = buildFeatureSnapshot(r, getTopFiles);
+  // 开发人员 join：名册在另一个文件，前端两处（评审卡 / 开发右栏）都要显示姓名。
+  // 在这里 join 一次，省掉前端「拿到需求再拉一次名册」的第二跳——
+  // 开发期右栏每 3s 轮询一次本接口，多一跳就是多一倍请求（同 mapLatest 的理由）。
+  // join 规则本身收在 ops 层，与定稿通知、归档快照共用同一份（见 resolveAssigneeList 注释）。
+  const assigneeList = resolveAssigneeList(r.assignees, { reqId: id });
+  sendJson(res, 200, {
+    ...r,
+    devDocLatest,
+    assigneeList,
+    // 地图一并带回，省掉前端「拿到需求再拉一次地图」的第二跳（busy 轮询每 3s 一次，多一跳就是多一倍请求）
+    mapLatest: readMapVersion(r),
+    queued: hasQueuedTasks(id),
+    // 排队窗口期前端要合成一个 busy 来显示进度，而「分析中」与「生成中」的文案和时长口径
+    // 完全不同，光有 queued 布尔值会把 quizgen 显示成「开发文档生成中」
+    queuedKind: queuedTasks(id)[0]?.kind ?? null,
+    devCwd: pickCwdAndDirs(r.projects).cwd,
+    sessions: normalizeSessions(r),
+    seed: r.phase === 'dev' || r.phase === 'test' ? buildSeedPrompt(r, { featureSnapshot }) : null,
+    featureTag: r.featureTag ?? null,
+    liveLog: docgenLiveLine.get(id) || null,
+  });
+}
+
+// ==== GET /api/req/doc?id=&v= ====
+function handleDoc(url, res) {
+  const id = str(url.searchParams.get('id'));
+  const r = getRequirement(id);
+  if (!r) return sendJson(res, 404, { error: '需求不存在' });
+  const v = Number(url.searchParams.get('v'));
+  const entry = (r.devDoc?.versions || []).find((x) => x.v === v);
+  if (!entry) return sendJson(res, 404, { error: '版本不存在' });
+  try {
+    const content = fs.readFileSync(entry.path, 'utf8');
+    sendJson(res, 200, { content });
+  } catch (e) {
+    sendJson(res, 500, { error: '读取失败：' + (e?.message || e) });
+  }
+}
+
+/** 单个工程配置校验：null 直接放行；否则须 {dir:非空字符串, dev:boolean} */
+function validateProjectEntry(p, key) {
+  if (p === null) return { value: null };
+  if (typeof p !== 'object') return { error: `${key} 工程配置格式不正确` };
+  const dir = str(p.dir);
+  if (!dir) return { error: `${key} 工程目录不能为空` };
+  if (typeof p.dev !== 'boolean') return { error: `${key} 工程 dev 标记必须为 boolean` };
+  return { value: { dir, dev: p.dev } };
+}
+
+/**
+ * projects 补丁：只重写请求里出现的 key，未出现的沿用既有值——
+ * updateRequirement 是浅合并，patch.projects 会整体替换掉旧的 projects 对象，
+ * 若只带一侧字段会把另一侧静默清空，因此这里以 existing 兜底拼出完整对象。
+ */
+function buildProjectsPatch(input, existing) {
+  const out = { frontend: existing?.frontend ?? null, backend: existing?.backend ?? null };
+  for (const key of ['frontend', 'backend']) {
+    if (!(key in input)) continue;
+    const r = validateProjectEntry(input[key], key);
+    if (r.error) return { error: r.error };
+    out[key] = r.value;
+  }
+  return { value: out };
+}
+
+/**
+ * reqDoc 补丁：{name,text} 落盘写入 req-doc.md；{name,path} 登记已上传文件（校验存在性）。
+ *
+ * url/fetchedAt 是在线来源（飞书文档）的溯源信息，只在提供时附带：下游读的始终是落盘快照，
+ * 这两个字段仅供界面显示来源、判断要不要给「刷新」按钮——粘贴与上传两种来源没有可刷新的源头。
+ */
+function buildReqDocPatch(id, reqDoc) {
+  if (reqDoc === null) return { value: null };
+  if (typeof reqDoc !== 'object') return { error: 'reqDoc 格式不正确' };
+  const name = str(reqDoc.name);
+  if (!name) return { error: 'reqDoc.name 不能为空' };
+  const origin = {};
+  if (str(reqDoc.url)) origin.url = str(reqDoc.url);
+  if (str(reqDoc.fetchedAt)) origin.fetchedAt = str(reqDoc.fetchedAt);
+  if (typeof reqDoc.text === 'string') {
+    const p = reqDir(id, 'req-doc.md');
+    fs.writeFileSync(p, reqDoc.text, 'utf8');
+    return { value: { name, path: p, ...origin } };
+  }
+  if (typeof reqDoc.path === 'string') {
+    const p = str(reqDoc.path);
+    if (!p || !fs.existsSync(p)) return { error: 'reqDoc.path 指向的文件不存在' };
+    return { value: { name, path: p, ...origin } };
+  }
+  return { error: 'reqDoc 需提供 text 或 path' };
+}
+
+// ==== PUT /api/req/config {id,projects,reqDoc} ====
+function handleConfig(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'review') return sendJson(res, 409, { error: '仅评审设计期可修改配置' });
+
+    const patch = {}; // 注意：title 不在允许字段之列，分支名依赖它，config 路由绝不接受修改
+
+    if (data.projects !== undefined) {
+      if (typeof data.projects !== 'object' || data.projects === null || Array.isArray(data.projects)) {
+        return sendJson(res, 400, { error: 'projects 格式不正确' });
+      }
+      const pr = buildProjectsPatch(data.projects, r.projects);
+      if (pr.error) return sendJson(res, 400, { error: pr.error });
+      patch.projects = pr.value;
+    }
+
+    if (data.reqDoc !== undefined) {
+      const dr = buildReqDocPatch(id, data.reqDoc);
+      if (dr.error) return sendJson(res, 400, { error: dr.error });
+      patch.reqDoc = dr.value;
+    }
+
+    if (data.notifyBotId !== undefined) {
+      patch.notifyBotId = typeof data.notifyBotId === 'string' && data.notifyBotId
+        ? data.notifyBotId
+        : null;
+    }
+
+    const updated = updateRequirement(id, patch, '更新需求配置');
+    logger.info('req-routes', '更新需求配置', {
+      reqId: id,
+      frontend: updated.projects?.frontend?.dir || null,
+      backend: updated.projects?.backend?.dir || null,
+      reqDoc: updated.reqDoc?.name || null,
+    });
+    sendJson(res, 200, updated);
+  });
+}
+
+/**
+ * PUT /api/req/assignees {id, assignees:[colleagueId]} —— 指派 / 修改开发人员。
+ *
+ * 刻意**不**并入 handleConfig：那条路由有「仅评审设计期可修改配置」的整体守卫，
+ * 而开发人员在开发期也要能改。往 handleConfig 里加字段级豁免，会让那句守卫文案变成谎言——
+ * 下一个读 handleConfig 的人必然误判「这里所有字段都只能评审期改」。
+ */
+function handleAssignees(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'review' && r.phase !== 'dev') {
+      return sendJson(res, 409, { error: '仅评审期与开发期可修改开发人员' });
+    }
+    if (!Array.isArray(data.assignees)) return sendJson(res, 400, { error: 'assignees 必须是数组' });
+    const ids = [...new Set(data.assignees.filter((x) => typeof x === 'string' && x))];
+    // 存在性校验：允许写入悬空 id 等于让「已移除的同事」凭空长出来，
+    // 而这里的悬空只该由「先指派、后删同事」产生
+    for (const cid of ids) {
+      if (!getColleague(cid)) return sendJson(res, 400, { error: `同事不存在：${cid}` });
+    }
+    const updated = updateRequirement(id, { assignees: ids }, '更新开发人员');
+    logger.info('req-routes', '更新开发人员', { reqId: id, count: ids.length });
+    sendJson(res, 200, { assignees: updated.assignees });
+  });
+}
+
+// ==== GET /api/req/colleague-messages?reqId=&colleagueId= ====
+// export：供 routes-requirements.test.js 直调（跨需求过滤 / lastInboundAt 回归测试无需真起 HTTP server）
+export function handleColleagueMessages(url, res) {
+  const reqId = str(url.searchParams.get('reqId'));
+  const colleagueId = str(url.searchParams.get('colleagueId'));
+  if (!reqId || !colleagueId) return sendJson(res, 400, { error: 'reqId / colleagueId 均必填' });
+  if (!getRequirement(reqId)) return sendJson(res, 404, { error: '需求不存在' });
+  // getColleagueThread 拿的是该人跨需求的整条线；这个端点只该给该需求的一段，
+  // 按消息上的 reqId 标签过滤，lastInboundAt 也要按过滤后的算——否则面板「最近来信」
+  // 会显示别的需求的时间
+  const all = getColleagueThread(colleagueId);
+  const messages = all.messages.filter((m) => m.reqId === reqId);
+  const lastInboundAt = messages.filter((m) => m.dir === 'in').at(-1)?.at || null;
+  sendJson(res, 200, { messages, lastInboundAt });
+}
+
+// ==== POST /api/req/colleague-messages/read {reqId, colleagueId} ====
+function handleColleagueRead(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const reqId = str(data.reqId);
+    const colleagueId = str(data.colleagueId);
+    if (!reqId || !colleagueId) return sendJson(res, 400, { error: 'reqId / colleagueId 均必填' });
+    // 与同组另外三个端点一致地校验需求存在：markColleagueRead 对未知会话本就不写盘，
+    // 但少这一句会让「需求已删」和「已读成功」回同一个 200，前端无从区分
+    if (!getRequirement(reqId)) return sendJson(res, 404, { error: '需求不存在' });
+    markColleagueRead(colleagueId, { reqId });
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== P5：web 监管面（按人看对话 / 工具轨迹 / 一键撤销）====
+//
+// 四条只读/标记类端点，供顶栏「同事」面板（public/js/colleague-supervisor.js）使用。
+// 与上方的「按需求」四个端点并存、互不替代：那条链服务需求工作流，这条链服务监管。
+
+// ==== GET /api/req/colleague-threads —— 名册 × 会话摘要（监管面列表）====
+//
+// 每条摘要额外带 `reqs`：**该同事被指派到的需求**（含 `phase`）。监管面要能主动发消息，而发送端点
+// （POST /api/req/colleague-messages/send）要求消息必须落在一条需求上、且该同事在这条需求的
+// 开发人员里 —— 归属下拉的候选就是这份名单，与发送侧的校验同源（都是 r.assignees），
+// 不在前端另算一份，否则两边迟早对不上（比如「已删同事的悬空 id」）。
+//
+// `phase` 一并给出（2026-10-16）：归属下拉只让选**进行中**的需求，已归档/已废弃的不能选
+//（选择规则在前端 `public/js/req-phase.logic.js`，与侧栏需求列表的活动分组同一份口径）。
+// 归档的仍留在列表里，是为了让前端能说清「他的需求都已归档」而不是「没被指派」。
+function handleColleagueThreads(res) {
+  const summaries = new Map(listThreadSummaries().map((s) => [s.colleagueId, s]));
+  const roleLabel = new Map(ROLES.map((r) => [r.id, r.label]));
+  const allReqs = getRequirements(); // 已按 updatedAt 倒序：常用的排前面，前端无需再排
+  const threads = getColleagues().map((c) => {
+    const s = summaries.get(c.id) || null;
+    return {
+      colleagueId: c.id,
+      name: c.name,
+      role: c.role,
+      roleLabel: roleLabel.get(c.role) || c.role || '',
+      feishuOpenId: c.feishuOpenId || '',
+      hasThread: !!s,
+      unread: s?.unread || 0,
+      lastAt: s?.lastAt || null,
+      lastText: s?.lastText || '',
+      messageCount: s?.messageCount || 0,
+      reqs: allReqs
+        .filter((r) => (r.assignees || []).includes(c.id))
+        .map((r) => ({ id: r.id, title: r.title, phase: r.phase || null })),
+    };
+  });
+  // 有对话的按 lastAt 倒序在前；无对话的按名册顺序殿后（sort 稳定，同组内保持原序）
+  threads.sort((a, b) => {
+    if (a.hasThread !== b.hasThread) return a.hasThread ? -1 : 1;
+    if (!a.hasThread) return 0;
+    return String(b.lastAt || '').localeCompare(String(a.lastAt || ''));
+  });
+  sendJson(res, 200, { threads });
+}
+
+// ==== GET /api/req/colleague-thread?colleagueId= —— 某人跨需求整条线（监管面）====
+function handleColleagueThreadGet(url, res) {
+  const colleagueId = str(url.searchParams.get('colleagueId'));
+  if (!colleagueId) return sendJson(res, 400, { error: 'colleagueId 必填' });
+  const c = getColleague(colleagueId);
+  if (!c) return sendJson(res, 404, { error: '同事不存在' });
+  const t = getColleagueThread(colleagueId);
+
+  // 归属展示：消息里出现过的 reqId → 标题（只查出现过的，不把全量需求倒给前端）
+  const reqTitles = {};
+  for (const m of t.messages) if (m.reqId) reqTitles[m.reqId] = null;
+  const ids = Object.keys(reqTitles);
+  if (ids.length) {
+    const byId = new Map(getRequirements().map((r) => [r.id, r.title]));
+    for (const id of ids) reqTitles[id] = byId.get(id) || null;
+  }
+
+  sendJson(res, 200, {
+    colleague: { id: c.id, name: c.name, role: c.role, feishuOpenId: c.feishuOpenId || '' },
+    messages: t.messages,
+    reqTitles,
+    lastInboundAt: t.lastInboundAt,
+  });
+}
+
+// ==== GET /api/req/agent-actions?colleagueId=&undoable=1 —— 写操作台账（P4 起由 recordLedger 写入）====
+const AGENT_ACTIONS_MAX = 200; // 防御上限：台账只增不减，面板一次不需要全部
+function handleAgentActions(url, res) {
+  const colleagueId = str(url.searchParams.get('colleagueId'));
+  const onlyUndoable = str(url.searchParams.get('undoable')) === '1';
+  let actions = getActions();
+  if (colleagueId) actions = actions.filter((a) => a.colleagueId === colleagueId);
+  if (onlyUndoable) actions = actions.filter((a) => isUndoable(a));
+  sendJson(res, 200, { actions: actions.slice(0, AGENT_ACTIONS_MAX) });
+}
+
+// ==== POST /api/req/colleague-thread/read {colleagueId} —— 该人全部未读置已读（监管面）====
+function handleColleagueThreadRead(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const colleagueId = str(data.colleagueId);
+    if (!colleagueId) return sendJson(res, 400, { error: 'colleagueId 必填' });
+    if (!getColleague(colleagueId)) return sendJson(res, 404, { error: '同事不存在' });
+    // 不带 reqId：监管面按人看，进谁的头像就清谁的未读（与按需求端点的口径差异是有意的）
+    markColleagueRead(colleagueId);
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== POST /api/req/colleague-messages/send {reqId, colleagueId, text} ====
+function handleColleagueSend(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const reqId = str(data.reqId);
+    const colleagueId = str(data.colleagueId);
+    const text = str(data.text);
+    if (!text) return sendJson(res, 400, { error: '消息内容不能为空' });
+    const r = getRequirement(reqId);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (!(r.assignees || []).includes(colleagueId)) {
+      return sendJson(res, 400, { error: '该同事不在本需求的开发人员里' });
+    }
+    const c = getColleague(colleagueId);
+    if (!c) return sendJson(res, 400, { error: '同事不存在' });
+    if (!c.feishuOpenId) return sendJson(res, 400, { error: `${c.name} 未填飞书 open_id，无法发送` });
+
+    // 与二期同一硬约束：名册 open_id 是用启用机器人的凭证取的，open_id 是应用维度的，
+    // 换个应用发根本对不上人
+    const bot = getActiveBot();
+    if (!bot?.appId || !bot?.appSecret) {
+      return sendJson(res, 502, { error: '请先在「托管配置」里启用一个飞书机器人并填全凭证' });
+    }
+    let ok = false;
+    try {
+      ok = await sendTextToUser({ appId: bot.appId, appSecret: bot.appSecret }, c.feishuOpenId, text);
+    } catch (e) {
+      return sendJson(res, 502, { error: '发送失败：' + (e?.message || String(e)) });
+    }
+    // 发送失败不落消息：落了界面会显示一条其实没送达的消息，比不显示更糟
+    if (!ok) return sendJson(res, 502, { error: '飞书发送失败，请检查机器人权限与 open_id' });
+    const entry = appendTo(colleagueId, { dir: 'out', text, status: 'read', role: c.role, reqId });
+    logger.info('req-routes', '向同事发送消息', { reqId, colleagueId });
+    sendJson(res, 200, { ok: true, message: entry });
+  });
+}
+
+// ==== POST /api/req/colleague-agent/turn {colleagueId, text, msgId?, files?, chatId?, chatType?, feishuMessageId?, reactionId?} ====
+// 飞书进程在落盘入站消息后跨进程触发（P3）。agent 必须在 web 进程跑：
+// 写工具要调本进程内存里的需求泵与 busy 状态机（见 colleague-agent/session.js 文件头）。
+//
+// 202 立即返回：对面是 3s 超时的 fire-and-forget，一轮 agent 要十几秒，同步等必然超时，
+// 而超时重发会在「入队到收尾」的窗口里制造重复任务（四期 auto-notify 踩过同款坑）。
+//
+// 摘除凭据（feishuMessageId / reactionId）：飞书侧贴在用户消息上的「正在处理」表情，
+// 摘除责任随本请求移交到这里 —— 终态答复（agent 回复 / 委托结论 / 追问）落在这之后，
+// 标记也该在那之后消失（见 shared/processing-mark.js 与 clearProcessingMark 的注释）。
+export async function handleColleagueAgentTurn(req, res, deps = {}) {
+  const {
+    handleTurn = handleColleagueTurn,
+    isEnabled = getPluginEnabled,
+    handleAskReply = handleColleagueAskReply,
+    clearMark = clearProcessingMark,
+  } = deps;
+  return withJsonBody(req, res, async (data) => {
+    const colleagueId = str(data?.colleagueId);
+    if (!colleagueId) {
+      // 消息被丢弃（回复永远不会来）：标记就地摘掉，别让它挂到 15 分钟兜底
+      clearMark(data);
+      return sendJson(res, 400, { error: '缺少 colleagueId' });
+    }
+    const text = str(data?.text);
+    const files = Array.isArray(data?.files) ? data.files : [];
+    // 纯空白且无附件 = 没内容可聊，起 agent 纯属烧额度
+    if (!text.trim() && !files.length) {
+      clearMark(data);
+      return sendJson(res, 400, { error: '缺少 text 或 files' });
+    }
+
+    // 「委托同事对话」的答复优先截获：命中进行中的委托 → 交给判定引擎（自动追问或结算），
+    // 不再启动同事对话 agent（否则一条消息两套处理，同事会收到两份回应）。
+    // 刻意放在插件启停检查之前：该闭环不依赖 colleague-agent 插件，插件停用时答复也不该丢。
+    const askHit = handleAskReply(colleagueId, { text, files });
+    if (askHit) {
+      sendJson(res, 202, { ok: true, delegated: true });
+      // fire-and-forget：步进异常在内层已兜住，这里再挂一道防未处理 rejection。
+      // 步进结束（追问已发出 / 已结算）即摘标记 —— 这条消息的处置到此为止。
+      askHit.step
+        .catch((e) => logger.warn('routes-req', '委托追问步进异常（已捕获）', { colleagueId, err: e?.message || String(e) }))
+        .finally(() => clearMark(data));
+      return;
+    }
+
+    if (!isEnabled('colleague-agent')) {
+      // 插件停用（设置页切换后、进程重启前的窗口）：本轮不会有人处理，标记同样就地摘掉
+      clearMark(data);
+      return sendJson(res, 409, { error: '同事对话 Agent 插件已停用' });
+    }
+
+    // 先回 202 再干活：顺序反了的话对面已经超时断开，这个响应发给了空气
+    sendJson(res, 202, { ok: true });
+    // fire-and-forget 必须带 catch：未捕获的 rejection 在 Node 里会让进程退出。
+    // 本轮结束（回复/ACK 已发出）即摘「正在处理」标记 —— 这正是「表态与真相对齐」的那一步。
+    handleTurn({
+      colleagueId,
+      text,
+      msgId: str(data?.msgId) || null,
+      files,
+      // P4：来源会话 chat id（tracking_report 发 HTML 报告附件用）。可空，不做格式校验——
+      // 它的唯一用途是「发文件时能不能发」，值不对的后果由发送层兜（发失败只降级成文字结论）。
+      chatId: str(data?.chatId) || '',
+      // 2026-10-13：来源会话类型，回复路由用（'group' 回群并 @ 提问人；否则私聊）。
+      // 不做枚举校验：resolveReplyTarget 只认 'group' 字面量，其余一律降级私聊，不会静默。
+      chatType: str(data?.chatType) || '',
+    })
+      .catch((e) =>
+        logger.warn('routes-req', 'colleague agent 一轮异常（已捕获）', {
+          colleagueId,
+          err: e?.message || String(e),
+        }),
+      )
+      .finally(() => clearMark(data));
+  });
+}
+
+/**
+ * 摘除飞书侧贴的「正在处理」标记（同事消息的表情）—— 摘除责任由飞书进程随 relay payload
+ * 移交（shared/processing-mark.js#transfer）：这条消息的终态答复在 web 侧发出，标记也在此刻消失。
+ * 尽力而为：缺凭据/凭证或删除失败都只留痕，**绝不抛错**（调用方是 fire-and-forget 的
+ * `.finally()`，rejection 会变成 unhandled）；飞书侧还有 15 分钟兜底上限，不会出现永远挂着的标记。
+ */
+async function clearProcessingMark(data = {}) {
+  try {
+    const { feishuMessageId = '', reactionId = '' } = data || {};
+    if (!feishuMessageId || !reactionId) return;
+    const bot = getActiveBot();
+    if (!bot?.appId || !bot?.appSecret) return;
+    await removeReactionWithCreds({ appId: bot.appId, appSecret: bot.appSecret }, feishuMessageId, reactionId);
+  } catch (e) {
+    logger.warn('routes-req', '摘除处理中标记失败（不影响本轮）', {
+      feishuMessageId: data?.feishuMessageId,
+      err: e?.message || String(e),
+    });
+  }
+}
+
+// ==== POST /api/req/feishu-ask/answer {questionId, option} ====
+// 同事在飞书「问同事」卡上点选选项 → 当作一次回答喂进判定引擎（自动追问 or 结算）。
+// 飞书进程 fire-and-forget 跨进程调用（3s 超时，与 colleague-agent/turn 同范式）。
+export async function handleFeishuAskAnswer(req, res, deps = {}) {
+  const { handleOption = handleColleagueAskOption } = deps;
+  return withJsonBody(req, res, async (data) => {
+    const questionId = str(data?.questionId);
+    const option = str(data?.option);
+    if (!questionId || !option) return sendJson(res, 400, { error: '缺少 questionId 或 option' });
+    const hit = handleOption(questionId, option);
+    // 迟到点击（委托已结算/过期）：不是错误，回 200 让飞书侧不告警
+    if (!hit) return sendJson(res, 200, { ok: false, reason: 'no-active-ask' });
+    sendJson(res, 202, { ok: true, delegated: true });
+    hit.step.catch((e) =>
+      logger.warn('routes-req', '飞书选项步进异常（已捕获）', { questionId, err: e?.message || String(e) }),
+    );
+  });
+}
+
+// ==== POST /api/req/feishu-ask/confirm {questionId, option} ====
+// 主机在 web 执行台点了「问同事」卡的选项 → 立即结算（结论＝开发者已确认：X）并通知同事。
+export async function handleFeishuAskConfirm(req, res, deps = {}) {
+  const { confirm = confirmAskFromHost } = deps;
+  return withJsonBody(req, res, async (data) => {
+    const questionId = str(data?.questionId);
+    const option = str(data?.option);
+    if (!questionId || !option) return sendJson(res, 400, { error: '缺少 questionId 或 option' });
+    const r = await confirm(questionId, option);
+    if (!r.ok) return sendJson(res, 409, { error: r.error });
+    sendJson(res, 200, { ok: true, conclusion: r.conclusion });
+  });
+}
+
+// ==== POST /api/req/doc-from-link {id,url?} ====
+/**
+ * 飞书云文档 → 需求文档快照。
+ *
+ * 首次拉取与「刷新」共用一个入口：url 省略时取 reqDoc.url 重拉，落盘覆盖同一份 req-doc.md。
+ * 存快照而不是每次生成时实时取，有两个原因：下游 runDocgen/runQuizGen 读的是落盘文件（同步读），
+ * 改实时取要把整条链路改成异步、且每次生成都多一个网络与权限失败点；更重要的是同一份需求的
+ * 多次生成（首版 + 若干次修订）必须基于同一份正文，否则文档中途被人改过会导致问题无法复现。
+ *
+ * 代价是文档在飞书改了不会自动同步，靠界面上的拉取时间与「刷新」按钮兜住。
+ */
+function handleDocFromLink(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'review') return sendJson(res, 409, { error: '仅评审设计期可修改配置' });
+
+    const url = str(data.url) || str(r.reqDoc?.url); // 省略 url = 刷新当前来源
+    if (!url) return sendJson(res, 400, { error: '缺少文档链接' });
+    const link = extractDocLinks(url)[0];
+    if (!link) return sendJson(res, 400, { error: '不是飞书云文档链接，只支持 /docx/ 与 /wiki/ 两种地址' });
+
+    let content;
+    try {
+      let docToken = link.token;
+      if (link.kind === 'wiki') {
+        // wiki 链接指向的是节点不是文档，多维表格/画板同样用 wiki 地址分享，必须先问清类型，
+        // 否则会拿一个 bitable token 去调 docx 接口，报错信息与真实原因对不上
+        const node = await resolveWikiNodeObj(link.token);
+        if (!node) return sendJson(res, 400, { error: 'wiki 节点不存在，或对机器人不可见' });
+        if (node.objType !== 'docx') {
+          return sendJson(res, 400, { error: `该 wiki 节点是「${node.objType}」而不是文档，不能作为需求文档` });
+        }
+        docToken = node.objToken;
+      }
+      content = await fetchDocRawContent(docToken);
+    } catch (e) {
+      const msg = e?.message || String(e);
+      logger.warn('req-routes', '拉取飞书文档失败', { reqId: id, url, err: msg });
+      // 最高频的失败原因是机器人不是该文档的协作者，错误里必须直接给出解法，
+      // 否则用户只看到一句飞书原文的 permission denied，不知道该去哪儿点什么
+      return sendJson(res, 502, {
+        error: `拉取飞书文档失败：${msg}。请确认已把机器人加为该文档的协作者，且应用已开通云文档读取权限。`,
+      });
+    }
+
+    if (!content.trim()) return sendJson(res, 400, { error: '文档内容为空，请确认链接指向的是需求正文' });
+    const title = content.split('\n')[0]?.trim().slice(0, 30) || '飞书需求文档';
+    const dr = buildReqDocPatch(id, {
+      name: `${title}.md`,
+      text: content,
+      url,
+      fetchedAt: new Date().toISOString(),
+    });
+    if (dr.error) return sendJson(res, 400, { error: dr.error });
+    const updated = updateRequirement(id, { reqDoc: dr.value }, `拉取飞书需求文档「${title}」`);
+    logger.info('req-routes', '飞书需求文档已落地', { reqId: id, title, chars: content.length });
+    sendJson(res, 200, updated);
+  });
+}
+
+// ==== POST /api/req/docgen {id} ====
+function handleDocgen(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'review') return sendJson(res, 409, { error: '仅评审设计期可生成开发文档' });
+    const { cwd } = pickCwdAndDirs(r.projects);
+    if (!cwd || !r.reqDoc) return sendJson(res, 400, { error: DOCGEN_GUIDE });
+    if (r.busy || hasQueuedTasks(id)) return sendJson(res, 409, { error: '文档生成已在进行或排队' });
+    logger.info('req-routes', '收到生成开发文档请求', { reqId: id, cwd, reqDoc: r.reqDoc?.name });
+    enqueueSystemTask(id, 'docgen', {});
+    sendJson(res, 202, { ok: true });
+  });
+}
+
+// ==== POST /api/req/supplement {id,text,files} ====
+function handleSupplement(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'review') return sendJson(res, 409, { error: '仅评审设计期可提交补充说明' });
+
+    const text = str(data.text);
+    const files = (Array.isArray(data.files) ? data.files : [])
+      .map((f) => ({ name: str(f?.name), path: str(f?.path) }))
+      .filter((f) => f.name || f.path); // 剔除 name/path 均空的占位条目，避免 files:[{}] 误判为「有附件」
+    if (!text && !files.length) return sendJson(res, 400, { error: 'text 或 files 至少需要一项' });
+
+    const supplement = {
+      id: 's_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+      text,
+      files,
+      at: new Date().toISOString(),
+    };
+    // 先落盘再入队：runDocgen 首版路径读的是落盘的 req.supplements，顺序反了会丢正文（见 requirement-ops.js 头注释）
+    updateRequirement(id, { supplements: [...r.supplements, supplement] }, '提交补充说明');
+
+    const { cwd } = pickCwdAndDirs(r.projects);
+    if (!cwd || !r.reqDoc) {
+      logger.info('req-routes', '补充说明已记录（配置未齐，暂不生成）', { reqId: id, chars: text.length, files: files.length });
+      return sendJson(res, 200, { ok: true, note: '已记录，配置齐全并生成初版后将自动纳入' });
+    }
+    logger.info('req-routes', '收到补充说明，入队修订文档', { reqId: id, chars: text.length, files: files.length });
+    enqueueSystemTask(id, 'docgen', { supplement });
+    sendJson(res, 202, { ok: true });
+  });
+}
+
+// ==== GET /api/req/finalize-precheck?id= ====
+// 定稿分支弹框的取数口：列出会建分支的开发工程、各自当前分支与本地分支清单。
+// 单独一个端点而不是并进 /api/req/get：它要跑几条 git 子进程，而 get 是 3s 轮询的热路径
+async function handleFinalizePrecheck(url, res) {
+  const id = str(url.searchParams.get('id'));
+  if (!getRequirement(id)) return sendJson(res, 404, { error: '需求不存在' });
+  const r = await finalizePrecheck(id);
+  if (!r.ok) return sendJson(res, r.status, { error: r.error });
+  sendJson(res, 200, { ok: true, suggested: r.suggested, projects: r.projects });
+}
+
+// ==== POST /api/req/finalize {id,force,branchMode,branch} ====
+function handleFinalize(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    if (!getRequirement(id)) return sendJson(res, 404, { error: '需求不存在' }); // 先 404，不让 finalizeGuard 对 null 回误导性 409
+    // branchMode 白名单收口在这里：透传任意字符串的话 resolveTargetBranch 会走兜底自动命名，
+    // 用户点了「沿用当前分支」却被静默开了新分支——比报错糟得多
+    const rawMode = str(data.branchMode);
+    const branchMode = rawMode === 'current' || rawMode === 'new' ? rawMode : '';
+    const result = await finalizeRequirement(id, {
+      force: !!data.force,
+      branchMode,
+      branch: str(data.branch),
+    });
+    if (!result.ok) {
+      const body = { error: result.error };
+      if (result.warn) {
+        body.warn = result.warn;
+        body.dirs = result.dirs; // 字段名须为 dirs，原样透传 ops 返回值
+      }
+      return sendJson(res, result.status, body);
+    }
+    // notified 原样透传：定稿是重要操作，「哪几位同事没收到、为什么」必须让用户看见，
+    // 否则他会以为消息都送达了、等着对方回复
+    sendJson(res, 200, { ok: true, branch: result.branch, notified: result.notified || null });
+  });
+}
+
+// ==== POST /api/req/apidoc {id,name,path} / DELETE /api/req/apidoc {id,docId} ====
+// 登记逻辑在 requirement-ops#registerApiDoc（与同事消息自动处理共用），路由只做 body 归一与状态码映射
+function handleApidocPost(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const result = registerApiDoc(getRequirement(str(data.id)), { name: str(data.name), path: str(data.path) });
+    if (!result.ok) return sendJson(res, result.status, { error: result.error });
+    sendJson(res, 202, { ok: true, action: result.action, doc: result.doc });
+  });
+}
+
+function handleApidocDelete(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'dev') return sendJson(res, 409, { error: '仅开发期可维护 API 文档' });
+    const docId = str(data.docId);
+    const apiDocs = r.apiDocs || [];
+    const idx = apiDocs.findIndex((d) => d.id === docId);
+    if (idx < 0) return sendJson(res, 404, { error: 'API 文档不存在' });
+    const doc = apiDocs[idx];
+    const nextApiDocs = apiDocs.filter((d) => d.id !== docId);
+    updateRequirement(id, { apiDocs: nextApiDocs }, `API 文档删除：${doc.name}`);
+    sendJson(res, 202, { ok: true, action: '删除', doc });
+  });
+}
+
+// ==== PUT /api/req/guidelines {id,text} ====
+function handleGuidelines(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'dev' && r.phase !== 'test') return sendJson(res, 409, { error: '仅开发/测试期可编辑设计准则' });
+    // fail-closed：非字符串一律归空串，避免 `[object Object]` 落盘；保留多行原样（不 trim）
+    const designGuidelines = (typeof data.text === 'string' ? data.text : '').slice(0, 5000);
+    updateRequirement(id, { designGuidelines }, '更新设计准则');
+    sendJson(res, 200, { ok: true, designGuidelines });
+  });
+}
+
+// ==== POST /api/req/conv {id,convId} ====
+/**
+ * 绑定需求主会话。除了写 convId，还必须往 sessions[] 登记一条**当前阶段**的 main 行——
+ * normalizeSessions 的「convId → 合成 main」只在 sessions 为空时生效，测试期换主会话时
+ * sessions 里已有开发期那批，合成路径不会触发，不显式登记的话新主会话在侧栏根本不出现，
+ * 也逃过阶段流转守卫（spec §6.2）。
+ */
+function handleConv(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    const convId = str(data.convId);
+    if (!convId) return sendJson(res, 400, { error: 'convId 不能为空' });
+
+    const sessions = normalizeSessions(r);
+    // 三种情形，顺序不能换：
+    // 1) 已有同 convId 的行 → 一个字段都不动（它可能已被 run 回填过 sessionId、被用户改过标题）。
+    //    覆盖的是前端网络重试。
+    // 2) 没有该 convId、但当前阶段已有 main → **重指**那一行的 convId，而不是新推一条。
+    //    换浏览器 / 桌面版 / 清过站点数据时，openRequirementChat 查的是本浏览器 localStorage，
+    //    会铸一个全新 convId 过来（req-view.js openRequirementChat + chat.js createReqConv）。
+    //    这正是 devSession 存在的那个「换浏览器重建 conv 续接」流程（requirements.js 字段注释）。
+    //    若新推一条，每换一个客户端就多一条同阶段 main —— 而 main 在 handleSessionDelete 里
+    //    被无条件保护、前端也不渲染删除按钮，用户除了手改 requirements.json 没有出路。
+    //    重指还保住了该行的 sessionId 与标题，让新 conv 直接续上原来的 Claude session。
+    // 3) 当前阶段还没有 main（刚流转完，或全新需求）→ 这才是真正该新建的时候。
+    const existing = sessions.find((s) => s.convId === convId);
+    if (!existing) {
+      const currentMain = sessions.find((s) => s.kind === 'main' && s.phase === r.phase);
+      if (currentMain) {
+        currentMain.convId = convId;
+      } else {
+        sessions.push({
+          convId,
+          sessionId: null,
+          title: r.title,
+          kind: 'main',
+          phase: r.phase,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    }
+    updateRequirement(id, { convId, sessions }, '绑定会话');
+    sendJson(res, 200, { ok: true, convId });
+  });
+}
+
+/**
+ * dev-done / test-pass 共用的阶段流转守卫：404 → canTransition 不过 409 → 有任务进行中/排队 409。
+ *
+ * 会话判据覆盖**当前阶段全部会话**而非只有主会话：开发期开的子会话（kind:'sub'）同样在改代码，
+ * 它还在跑就流转，等于让上个阶段的 run 在新阶段继续落盘（spec §1 缺陷 A）。
+ */
+function phaseGuard(id, toPhase) {
+  const r = getRequirement(id);
+  if (!r) return { ok: false, status: 404, error: '需求不存在' };
+  const t = canTransition(r.phase, toPhase);
+  if (!t.ok) return { ok: false, status: 409, error: t.error };
+  if (r.busy || hasQueuedTasks(id)) {
+    return { ok: false, status: 409, error: '有任务进行中/排队，请先等待完成或停止' };
+  }
+  // ★ 第二参传 r.phase（当前阶段），不是 toPhase。传目标阶段会让守卫检查一批还不存在的会话、
+  // 对当前正在跑的那批视而不见——真空通过。runningSessions 的形参就叫 currentPhase，别传错。
+  const running = runningSessions(normalizeSessions(r), r.phase, hasActiveRunForConv);
+  if (running.length) {
+    return { ok: false, status: 409, error: '有会话正在运行，请先等待完成或停止', running };
+  }
+  return { ok: true };
+}
+
+// ==== POST /api/req/dev-done {id} ====
+function handleDevDone(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const g = phaseGuard(id, 'test');
+    if (!g.ok) return sendJson(res, g.status, { error: g.error, running: g.running });
+    const r = getRequirement(id);
+    // ★ normalizeSessions(r) 必须在这一次 updateRequirement 之前、且读未更新的 r 求值，两个理由：
+    //   1) 老需求的主会话是读侧靠 convId 合成的，锚点一清合成路径就失效，开发期这段历史
+    //      再也拿不回来（归档期「优化汇总」会直接少一整段）；
+    //   2) normalizeSessions 的 phase 缺省取 req.phase，此刻还是 'dev'。若改成先落 phase:'test'
+    //      再去 normalizeSessions(getRequirement(id))，开发期会话会被全部钉成 'test'、此后永不被隐藏——
+    //      功能静默退化成空操作，不报错也不红测。下面那条「会话缺 phase 时按流转前的阶段物化成 dev」
+    //      的用例是这条不变式的唯一护栏——前两条用例的 fixture 都显式带了 phase，钉不住它。
+    // 清 convId/devSession 是「测试期开新主会话」的触发器：前端见空锚点走既有的
+    // 「新建 conv 并回填」路径（req-view.js openRequirementChat），开发期会话随 phase 沉为历史。
+    const updated = updateRequirement(
+      id,
+      { sessions: normalizeSessions(r), phase: 'test', convId: null, devSession: null },
+      '开发完成，进入测试期（开发期会话已归档）',
+    );
+    logger.info('req-routes', '阶段流转：开发→测试', { reqId: id, archivedSessions: updated.sessions.length });
+    sendJson(res, 200, { ok: true, phase: updated.phase });
+  });
+}
+
+// ==== POST /api/req/test-pass {id} ====
+function handleTestPass(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const g = phaseGuard(id, 'archiving');
+    if (!g.ok) return sendJson(res, g.status, { error: g.error, running: g.running });
+    const updated = updateRequirement(id, { phase: 'archiving' }, '测试通过，进入归档期');
+    logger.info('req-routes', '阶段流转：测试→归档', { reqId: id });
+    sendJson(res, 200, { ok: true, phase: updated.phase });
+  });
+}
+
+// ==== POST /api/req/archive {id,note} ====
+function handleArchive(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    if (!getRequirement(id)) return sendJson(res, 404, { error: '需求不存在' }); // 先 404，不让 archiveRequirement 对 null 回误导性 409
+    const result = await archiveRequirement(id, data.note);
+    if (!result.ok) return sendJson(res, result.status, { error: result.error });
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== POST /api/req/discard {id} ====
+function handleDiscard(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase === 'discarded') return sendJson(res, 409, { error: '需求已是废弃状态' });
+    if (r.phase === 'archived') return sendJson(res, 409, { error: '已归档需求无法废弃' });
+    updateRequirement(id, { phase: 'discarded', discardedAt: Date.now() }, '需求已废弃');
+    logger.info('req-routes', '废弃需求', { reqId: id, fromPhase: r.phase });
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== POST /api/req/delete {id} ====
+// 物理移除已废弃的需求。只开放给 discarded：活跃需求的入口是「废弃」，已归档需求是存档不该删，
+// 侧栏右键菜单也只对废弃行给「移除」——这里把同一条契约在服务端再钉一遍，防 API 直调绕过。
+export function handleDelete(req, res, deps = {}) {
+  const { runScript: runGit = runScript } = deps;
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'discarded') return sendJson(res, 409, { error: '仅已废弃的需求可移除' });
+    if (r.busy || hasQueuedTasks(id)) return sendJson(res, 409, { error: '有任务进行中或排队，请稍候' });
+
+    // 会话 id 必须在删记录之前取：删完就再也查不到它绑过哪些 conv，
+    // 前端 localStorage 里的聊天记录就会变成永远清不掉的孤儿。
+    const convIds = [...new Set(normalizeSessions(r).map((s) => s.convId).filter(Boolean))];
+
+    // 先回收 agent worktree 再删需求记录：顺序反了就读不到 agentWorktrees 了，
+    // 目录会永远留在盘上（每个都是一份完整工作区拷贝）
+    for (const w of r.agentWorktrees || []) {
+      // 幂等：目录不存在时 git 返回非 0 但无副作用。失败只告警——
+      // 删不掉一个临时目录不该阻止用户删需求
+      const rm = await runGit('git', ['-C', w.dir, 'worktree', 'remove', '--force', w.worktreeDir], { shell: false });
+      if (!rm.ok) logger.warn('req-routes', '回收 agent worktree 失败（不阻塞删除）', { reqId: id, dir: w.worktreeDir });
+    }
+
+    deleteRequirement(id);
+    // 磁盘产物与同事对话紧随其后。两者失败都不回滚记录——记录已删是用户看得见的结果，
+    // 为残留文件把需求变回来只会更费解；留 warn 供事后清理。
+    try {
+      fs.rmSync(reqDir(id), { recursive: true, force: true });
+    } catch (e) {
+      logger.warn('req-routes', '移除需求目录失败', { reqId: id, err: e?.message || String(e) });
+    }
+    try {
+      dropReqThreads(id);
+    } catch (e) {
+      logger.warn('req-routes', '移除同事对话失败', { reqId: id, err: e?.message || String(e) });
+    }
+    logger.info('req-routes', '移除需求', { reqId: id, convIds: convIds.length });
+    sendJson(res, 200, { ok: true, convIds });
+  });
+}
+
+// ==== POST /api/req/bitable {id,url} ====
+function handleBitable(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    if (r.phase !== 'test') return sendJson(res, 409, { error: '仅测试期可进行表格巡检' });
+    if (r.busy || hasQueuedTasks(id)) return sendJson(res, 409, { error: '有任务进行中或排队，请稍候' });
+    // 身份预检（N2）：受理前先挡住，避免用户等半天才在 history 里发现「被拒」
+    if (!currentInspectIdentity()) {
+      return sendJson(res, 400, { error: '请先在设置页填写「我的飞书 open_id」（基础设置 → 我的飞书身份）' });
+    }
+    const url = str(data.url);
+    if (!url || !parseBitableLink(url)) return sendJson(res, 400, { error: '未识别出多维表格链接' });
+    sendJson(res, 202, { ok: true });
+    // 巡检自己管 busy（同步写在第一个 await 之前）；路由不 await，失败原因由 inspectBitable 自行落 history
+    inspectBitable(id, url).catch((e) =>
+      logger.error('req-routes', '表格巡检任务异常', { reqId: id, err: e?.message || String(e) }),
+    );
+  });
+}
+
+// ==== POST /api/req/session {id, convId, sessionId?, title?, kind?} ====
+function handleSession(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+
+    const convId = str(data.convId);
+    const sessionId = data.sessionId ? str(data.sessionId) : null;
+    // title 缺省必须是 null 而非 '新会话'：本接口既是「登记」也是「run 启动后回填 sessionId」的入口，
+    // 回填方（chat.js 的 session 事件）不关心标题也就不会传 title。若在此兜底成默认名，
+    // 下面的「有变化就覆盖」会把用户改过的标题一路打回「新会话」——跑一次 run 就丢一次。
+    // 兜底改到「新建」分支里做：只有没有既有记录可保时才需要默认名。
+    const title = data.title ? str(data.title) : null;
+    const kind = data.kind ? str(data.kind) : 'sub';
+
+    // 幂等 upsert
+    const sessions = normalizeSessions(r);
+    // 本函数内所有 phase 判据都直接比较、不加 || 'dev' 兜底：sessions 是 normalizeSessions 的产物，
+    // 每行都保证带 phase（与 req-logic.js runningSessions 不同——那个是导出函数，会收到未归一的裸数组，
+    // 所以那边的冗余防御要留）。
+    const idx = sessions.findIndex((s) => s.convId === convId);
+
+    let updated = false;
+    let devSessionPatch = null;
+
+    if (idx >= 0) {
+      // ★ 保护：kind 若被传入，必须与既有一致
+      if (data.kind && str(data.kind) !== sessions[idx].kind) {
+        return sendJson(res, 409, { error: '不能改变已有会话的 kind' });
+      }
+      // 更新：补齐 sessionId / 更新 title，但不改 kind
+      const existing = sessions[idx];
+      if (sessionId && !existing.sessionId) {
+        existing.sessionId = sessionId;
+        updated = true;
+      }
+      if (title && title !== existing.title) {
+        existing.title = title;
+        updated = true;
+      }
+    } else {
+      // 阶段内 main 唯一：跨阶段共存合法（开发期一条 + 测试期一条），同阶段第二条是数据错乱。
+      // 注意 handleConv 已会为主会话登记 main 行，正常前端流程不会走到这里再建 main。
+      if (kind === 'main' && sessions.some((s) => s.kind === 'main' && s.phase === r.phase)) {
+        return sendJson(res, 409, { error: '当前阶段已有主会话' });
+      }
+      // 新增：此时没有既有标题可保，才用默认名兜底
+      sessions.push({
+        convId,
+        sessionId,
+        title: title || '新会话',
+        kind,
+        phase: r.phase,
+        createdAt: new Date().toISOString(),
+      });
+      updated = true;
+    }
+
+    // devSession 回写认「既有记录的 kind」而不是请求传入的 kind：
+    // 回填方不传 kind 时上面会默认成 'sub'，用它判断的话主会话的 devSession 永远回填不了。
+    // 再加一道 phase 判据：历史阶段（如开发期）的 main 若有迟到的 sessionId 回填，
+    // 不能覆盖当前阶段的 devSession 锚点——那会让 bug-fix 续到上个阶段的 session 上去。
+    // else 半边取 length - 1：走到这里说明上面同阶段 main 409 已提前返回过、没命中，
+    // 必然刚 push 过一条，末位就是它。
+    const target = idx >= 0 ? sessions[idx] : sessions[sessions.length - 1];
+    const effectiveKind = target.kind;
+    if (effectiveKind === 'main' && sessionId && target.phase === r.phase) {
+      devSessionPatch = sessionId;
+    }
+
+    // 只在有更新时落盘
+    if (updated || !r.sessions || r.sessions.length === 0) {
+      const patch = { sessions };
+      if (devSessionPatch) {
+        patch.devSession = devSessionPatch;
+      }
+      const event =
+        effectiveKind === 'main' ? '主会话 sessionId 回填' : `会话登记 ${title || target.title}`;
+      updateRequirement(id, patch, event);
+    }
+
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== DELETE /api/req/session {id, convId} ====
+function handleSessionDelete(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+
+    const convId = str(data.convId);
+    const sessions = normalizeSessions(r);
+
+    const idx = sessions.findIndex((s) => s.convId === convId);
+    if (idx < 0) return sendJson(res, 404, { error: '会话不存在' });
+
+    if (sessions[idx].kind === 'main') {
+      // 所有阶段的 main 都不可删：当前阶段的是 bug-fix 落点，历史阶段的是归档期「优化汇总」的转录数据源。
+      return sendJson(res, 409, { error: '不能删除主会话（bug-fix 落点 / 归档汇总数据源）' });
+    }
+
+    const title = sessions[idx]?.title || convId;
+    sessions.splice(idx, 1);
+    updateRequirement(id, { sessions }, `删除会话 ${title}`);
+
+    sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== GET /api/req/pitfalls/get?dir=<projectDir> ====
+/** 拉取指定工程目录的现有避坑清单内容 */
+async function handlePitfallsGet(url, res) {
+  try {
+    const dir = str(url.searchParams.get('dir'));
+    if (!dir) return sendJson(res, 400, { error: 'dir 参数不能为空' });
+
+    const { readFile } = await import('./req-pitfalls.js');
+    const { ensurePitfallsPath } = await import('./req-pitfalls.js');
+    const filePath = ensurePitfallsPath(dir);
+    const content = await readFile(filePath);
+
+    sendJson(res, 200, { ok: true, content: content || '' });
+  } catch (e) {
+    logger.error('req-pitfalls-get', '读取避坑清单失败', { err: e?.message || String(e) });
+    sendJson(res, 500, { ok: false, error: '读取失败' });
+  }
+}
+
+// ==== POST /api/req/pitfalls {id, frontend: [], backend: []} ====
+function handlePitfalls(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+
+    const frontend = Array.isArray(data.frontend) ? data.frontend : [];
+    const backend = Array.isArray(data.backend) ? data.backend : [];
+
+    const written = { frontend: 0, backend: 0 };
+    const skipped = [];
+
+    if (frontend.length > 0 && r.projects?.frontend?.dir && r.projects.frontend.dev) {
+      // 与后端一致：有数据 + 配置 + dev=true → 写
+      try {
+        await writePitfalls(r.projects.frontend.dir, frontend);
+        await ensureClaudeMdRef(r.projects.frontend.dir);
+        written.frontend = frontend.length;
+      } catch (e) {
+        skipped.push({ side: 'frontend', error: e.message });
+      }
+    } else if (frontend.length > 0) {
+      // 无数据或无配置或非开发工程 → 跳过
+      if (!r.projects?.frontend?.dir) {
+        skipped.push({ side: 'frontend', error: '前端工程未配置' });
+      } else if (!r.projects.frontend.dev) {
+        skipped.push({ side: 'frontend', error: '前端为只读工程，不写入' });
+      }
+    }
+
+    if (backend.length > 0 && r.projects?.backend?.dir && r.projects.backend.dev) {
+      // 只写 dev=true 的工程
+      try {
+        await writePitfalls(r.projects.backend.dir, backend);
+        await ensureClaudeMdRef(r.projects.backend.dir);
+        written.backend = backend.length;
+      } catch (e) {
+        skipped.push({ side: 'backend', error: e.message });
+      }
+    } else if (backend.length > 0) {
+      if (!r.projects?.backend?.dir) {
+        skipped.push({ side: 'backend', error: '后端工程未配置' });
+      } else if (!r.projects.backend.dev) {
+        skipped.push({ side: 'backend', error: '后端为只读工程，不写入' });
+      }
+    }
+
+    sendJson(res, 200, { ok: true, written, skipped });
+  });
+}
+
+/** confirm/ignore/retry 三个 BUG 操作路由共用的接线：404 前置校验需求存在，其余状态判定交给 fn */
+function handleBugAction(fn) {
+  return (req, res) =>
+    withJsonBody(req, res, async (data) => {
+      const id = str(data.id);
+      if (!getRequirement(id)) return sendJson(res, 404, { error: '需求不存在' });
+      const bugId = str(data.bugId);
+      if (!bugId) return sendJson(res, 400, { error: 'bugId 不能为空' });
+      const result = await fn(id, bugId);
+      if (!result.ok) return sendJson(res, result.status, { error: result.error });
+      sendJson(res, 200, { ok: true });
+    });
+}
+
+const handleBugConfirm = handleBugAction(confirmBug);
+const handleBugIgnore = handleBugAction(ignoreBug);
+const handleBugRetry = handleBugAction(retryBug);
+
+// ==== PUT /api/req/feature-tag ====
+function handleFeatureTag(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+    const r = getRequirement(id);
+    if (!r) return sendJson(res, 404, { error: '需求不存在' });
+    // tag 为空字符串视为清除
+    const tag = str(data.tag) || null;
+    if (tag && tag.length > 20) return sendJson(res, 400, { error: 'tag 不能超过 20 字符' });
+    updateRequirement(id, { featureTag: tag }, tag ? `手动设置功能模块标签：${tag}` : '清除功能模块标签');
+    sendJson(res, 200, { ok: true, featureTag: tag });
+  });
+}
+
+// ==== POST /api/req/docgen/stop ====
+function handleDocgenStop(req, res) {
+  return withJsonBody(req, res, (data) => {
+    const id = str(data.id);
+    if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+
+    const abort = docgenAborts.get(id);
+    if (!abort) return sendJson(res, 404, { error: '无进行中的生成任务' });
+
+    // 标记用户主动停止，runDocgen 的 catch 里据此区分事件类型
+    userStoppedSet.add(id);
+    try {
+      abort.abort(new Error('用户停止'));
+    } catch (e) {
+      logger.warn('req-routes', 'docgenStop abort 调用异常', { reqId: id, err: e?.message });
+    }
+    logger.info('req-routes', 'docgen 停止已请求', { reqId: id });
+    return sendJson(res, 200, { ok: true });
+  });
+}
+
+// ==== GET /api/feature-index ====
+function handleFeatureIndex(res) {
+  sendJson(res, 200, { index: getFeatureIndex() });
+}
+
+// ==== POST /api/req/agent-action/undo {id} —— 撤销一条 agent 写操作（P4）====
+// 执行逻辑在 undo-agent-action.js（六种 kind 的分派与铁律都写在那里）。
+// UI 归 P5 监管面；本期先给路由，供手工验收与后续卡片按钮复用（spec §九/§十五）。
+function handleAgentActionUndo(req, res) {
+  return withJsonBody(req, res, async (data) => {
+    const id = str(data.id);
+    if (!id) return sendJson(res, 400, { error: 'id 不能为空' });
+    const result = await undoAgentAction(id);
+    if (!result.ok) return sendJson(res, 409, { error: result.error });
+    sendJson(res, 200, { ok: true, note: result.note || null });
+  });
+}
+
+/** 需求工作流路由单入口：按 pathname + method 分发 */
+export function handleRequirementRoutes(req, res, url) {
+  const { pathname } = url;
+  const { method } = req;
+  // 需求 v2（问卷/地图/变动/UI 规范）单独成文件，命中即返回；未命中落回下面的原分发表
+  if (handleReqV2Routes(req, res, url, pathname, method)) return;
+  if (pathname === '/api/req/create' && method === 'POST') return handleCreate(req, res);
+  if (pathname === '/api/req/list' && method === 'GET') return handleList(res);
+  if (pathname === '/api/req/get' && method === 'GET') return handleGet(url, res);
+  if (pathname === '/api/req/doc' && method === 'GET') return handleDoc(url, res);
+  if (pathname === '/api/req/config' && method === 'PUT') return handleConfig(req, res);
+  if (pathname === '/api/req/assignees' && method === 'PUT') return handleAssignees(req, res);
+  if (pathname === '/api/req/colleague-messages' && method === 'GET') return handleColleagueMessages(url, res);
+  if (pathname === '/api/req/colleague-messages/read' && method === 'POST') return handleColleagueRead(req, res);
+  if (pathname === '/api/req/colleague-messages/send' && method === 'POST') return handleColleagueSend(req, res);
+  if (pathname === '/api/req/colleague-agent/turn' && method === 'POST') return handleColleagueAgentTurn(req, res);
+  // 「问同事」卡片双向联动：同事点飞书卡（answer）/ 主机点 web 卡（confirm）
+  if (pathname === '/api/req/feishu-ask/answer' && method === 'POST') return handleFeishuAskAnswer(req, res);
+  if (pathname === '/api/req/feishu-ask/confirm' && method === 'POST') return handleFeishuAskConfirm(req, res);
+  if (pathname === '/api/req/agent-action/undo' && method === 'POST') return handleAgentActionUndo(req, res);
+  // P5 监管面四端点（按人）
+  if (pathname === '/api/req/colleague-threads' && method === 'GET') return handleColleagueThreads(res);
+  if (pathname === '/api/req/colleague-thread' && method === 'GET') return handleColleagueThreadGet(url, res);
+  if (pathname === '/api/req/colleague-thread/read' && method === 'POST') return handleColleagueThreadRead(req, res);
+  if (pathname === '/api/req/agent-actions' && method === 'GET') return handleAgentActions(url, res);
+  if (pathname === '/api/req/doc-from-link' && method === 'POST') return handleDocFromLink(req, res);
+  if (pathname === '/api/req/docgen' && method === 'POST') return handleDocgen(req, res);
+  if (pathname === '/api/req/docgen/stop' && method === 'POST') return handleDocgenStop(req, res);
+  if (pathname === '/api/req/supplement' && method === 'POST') return handleSupplement(req, res);
+  if (pathname === '/api/req/finalize-precheck' && method === 'GET') return handleFinalizePrecheck(url, res);
+  if (pathname === '/api/req/finalize' && method === 'POST') return handleFinalize(req, res);
+  if (pathname === '/api/req/apidoc' && method === 'POST') return handleApidocPost(req, res);
+  if (pathname === '/api/req/apidoc' && method === 'DELETE') return handleApidocDelete(req, res);
+  if (pathname === '/api/req/guidelines' && method === 'PUT') return handleGuidelines(req, res);
+  if (pathname === '/api/req/conv' && method === 'POST') return handleConv(req, res);
+  if (pathname === '/api/req/session' && method === 'POST') return handleSession(req, res);
+  if (pathname === '/api/req/session' && method === 'DELETE') return handleSessionDelete(req, res);
+  if (pathname === '/api/req/pitfalls' && method === 'GET') return handlePitfallsGet(url, res);
+  if (pathname === '/api/req/pitfalls' && method === 'POST') return handlePitfalls(req, res);
+  if (pathname === '/api/req/dev-done' && method === 'POST') return handleDevDone(req, res);
+  if (pathname === '/api/req/test-pass' && method === 'POST') return handleTestPass(req, res);
+  if (pathname === '/api/req/archive' && method === 'POST') return handleArchive(req, res);
+  if (pathname === '/api/req/discard' && method === 'POST') return handleDiscard(req, res);
+  if (pathname === '/api/req/delete' && method === 'POST') return handleDelete(req, res);
+  if (pathname === '/api/req/bitable' && method === 'POST') return handleBitable(req, res);
+  if (pathname === '/api/req/bug/confirm' && method === 'POST') return handleBugConfirm(req, res);
+  if (pathname === '/api/req/bug/ignore' && method === 'POST') return handleBugIgnore(req, res);
+  if (pathname === '/api/req/bug/retry' && method === 'POST') return handleBugRetry(req, res);
+  if (pathname === '/api/req/feature-tag' && method === 'PUT') return handleFeatureTag(req, res);
+  if (pathname === '/api/feature-index' && method === 'GET') return handleFeatureIndex(res);
+  return sendJson(res, 404, { error: 'not found' });
+}

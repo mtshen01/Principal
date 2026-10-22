@@ -1,0 +1,765 @@
+{
+  "s1_multi_step_tool_loop": {
+    "runs": [
+      {
+        "tools": [
+          "AskColleague",
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Task",
+          "TodoWrite",
+          "WaitColleagueReply",
+          "WebFetch",
+          "WebSearch",
+          "Write",
+          "exec_command",
+          "interrupt_agent",
+          "kill_process",
+          "list_agents",
+          "list_processes",
+          "send_message",
+          "wait_agent",
+          "write_stdin"
+        ],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。"
+            },
+            {
+              "role": "user",
+              "content": "读 hello.txt"
+            }
+          ],
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。"
+            },
+            {
+              "role": "user",
+              "content": "读 hello.txt"
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "toolCallId": "sc1",
+                  "toolName": "Read",
+                  "input": {
+                    "file_path": "<DATA>/hello.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "sc1",
+                  "toolName": "Read",
+                  "output": {
+                    "type": "text",
+                    "value": "1: hello from snapshot"
+                  }
+                }
+              ]
+            }
+          ]
+        ]
+      }
+    ]
+  },
+  "s2_dirty_history_normalized": {
+    "runs": [
+      {
+        "tools": [
+          "AskColleague",
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Task",
+          "TodoWrite",
+          "WaitColleagueReply",
+          "WebFetch",
+          "WebSearch",
+          "Write",
+          "exec_command",
+          "interrupt_agent",
+          "kill_process",
+          "list_agents",
+          "list_processes",
+          "send_message",
+          "wait_agent",
+          "write_stdin"
+        ],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。"
+            },
+            {
+              "role": "user",
+              "content": "背景：一批数据"
+            },
+            {
+              "role": "user",
+              "content": {
+                "$len": 120013,
+                "head": "超长背景数据：xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "tail": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+              }
+            },
+            {
+              "role": "user",
+              "content": "先读 a.txt"
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "toolCallId": "sn1",
+                  "toolName": "Read",
+                  "input": {
+                    "path": "a.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "sn1",
+                  "toolName": "Read",
+                  "output": {
+                    "type": "text",
+                    "value": "a.txt 的内容"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": "继续"
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "toolCallId": "sn2",
+                  "toolName": "Read",
+                  "input": {
+                    "path": "b.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "sn2",
+                  "toolName": "Read",
+                  "output": {
+                    "type": "text",
+                    "value": "进程中断，该工具未执行"
+                  }
+                }
+              ]
+            }
+          ]
+        ]
+      }
+    ]
+  },
+  "s3_compaction_summary_and_main": {
+    "runs": [
+      {
+        "tools": [],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是会话压缩器。把给定的对话历史压缩成一份供同一位助手继续工作用的要点备忘。必须按四个小节输出，某节没有内容也要保留小节标题：【进度与决策】已完成的工作与关键决定；【约束与偏好】用户的目标、约束与偏好；【待办与下一步】未完成事项与下一步动作；【关键数据】命令/路径/ID/报错原文等继续工作必须核实的事实。丢弃：寒暄、重复、已被后续修正的中间方案。绝不编造未出现的信息。只输出要点文本，不要寒暄。"
+            },
+            {
+              "role": "user",
+              "content": "【新增需要并入摘要的对话】\n【用户】u0\n【助手】a1\n【用户】u2\n【助手】a3\n【用户】u4\n【助手】a5\n【用户】u6\n【助手】a7\n【用户】u8\n【助手】a9\n【用户】u10\n【助手】a11\n【用户】u12\n【助手】a13\n【用户】u14\n【助手】a15\n【用户】u16\n【助手】a17\n【用户】u18\n【助手】a19\n【用户】u20\n【助手】a21\n【用户】u22\n【助手】a23\n【用户】u24\n【助手】a25\n【用户】u26\n【助手】a27\n【用户】u28\n【助手】a29\n【用户】u30\n【助手】a31\n【用户】u32\n【助手】a33\n【用户】u34\n【助手】a35\n【用户】u36\n【助手】a37\n【用户】u38\n【助手】a39\n【用户】u40\n【助手】a41\n【用户】u42\n【助手】a43\n【用户】u44\n【助手】a45\n【用户】u46\n【助手】a47\n【用户】u48\n【助手】a49\n【用户】u50\n【助手】a51\n【用户】u52\n【助手】a53\n【用户】u54\n【助手】a55\n【用户】u56\n【助手】a57\n【用户】u58\n【助手】a59\n【用户】u60\n【助手】a61\n【用户】u62\n【助手】a63\n【用户】u64\n【助手】a65\n【用户】u66\n【助手】a67\n【用户】u68\n【助手】a69\n【用户】u70\n【助手】a71\n【用户】u72\n【助手】a73\n【用户】u74\n【助手】a75\n【用户】u76\n【助手】a77\n【用户】u78\n【助手】a79\n【用户】u80\n【助手】a81\n【用户】u82\n【助手】a83\n【用户】u84\n【助手】a85\n【用户】u86\n【助手】a87\n【用户】u88\n【助手】a89\n【用户】u90\n【助手】a91\n【用户】u92\n【助手】a93\n【用户】u94\n【助手】a95\n【用户】u96\n【助手】a97\n【用户】u98\n【助手】a99\n【用户】u100\n【助手】a101\n【用户】u102\n【助手】a103\n【用户】u104\n【助手】a105\n【用户】u106\n【助手】a107\n【用户】u108\n【助手】a109\n【用户】u110\n【助手】a111\n【用户】u112\n【助手】a113\n【用户】u114\n【助手】a115\n【用户】u116\n【助手】a117\n【用户】u118\n【助手】a119\n\n请输出更新后的单一摘要，固定四个小节：【进度与决策】【约束与偏好】【待办与下一步】【关键数据】（纯文本要点，总字数控制在 800 字以内）。"
+            }
+          ]
+        ]
+      },
+      {
+        "tools": [
+          "AskColleague",
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Task",
+          "TodoWrite",
+          "WaitColleagueReply",
+          "WebFetch",
+          "WebSearch",
+          "Write",
+          "exec_command",
+          "interrupt_agent",
+          "kill_process",
+          "list_agents",
+          "list_processes",
+          "send_message",
+          "wait_agent",
+          "write_stdin"
+        ],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。\n\n## 历史摘要（较早对话的自动摘要；原文已保留在系统中，需要细节时可要求核对原文）\n摘要快照"
+            },
+            {
+              "role": "user",
+              "content": "u120"
+            },
+            {
+              "role": "assistant",
+              "content": "a121"
+            },
+            {
+              "role": "user",
+              "content": "u122"
+            },
+            {
+              "role": "assistant",
+              "content": "a123"
+            },
+            {
+              "role": "user",
+              "content": "u124"
+            },
+            {
+              "role": "assistant",
+              "content": "a125"
+            },
+            {
+              "role": "user",
+              "content": "u126"
+            },
+            {
+              "role": "assistant",
+              "content": "a127"
+            },
+            {
+              "role": "user",
+              "content": "u128"
+            },
+            {
+              "role": "assistant",
+              "content": "a129"
+            },
+            {
+              "role": "user",
+              "content": "u130"
+            },
+            {
+              "role": "assistant",
+              "content": "a131"
+            },
+            {
+              "role": "user",
+              "content": "u132"
+            },
+            {
+              "role": "assistant",
+              "content": "a133"
+            },
+            {
+              "role": "user",
+              "content": "u134"
+            },
+            {
+              "role": "assistant",
+              "content": "a135"
+            },
+            {
+              "role": "user",
+              "content": "u136"
+            },
+            {
+              "role": "assistant",
+              "content": "a137"
+            },
+            {
+              "role": "user",
+              "content": "u138"
+            },
+            {
+              "role": "assistant",
+              "content": "a139"
+            },
+            {
+              "role": "user",
+              "content": "u140"
+            },
+            {
+              "role": "assistant",
+              "content": "a141"
+            },
+            {
+              "role": "user",
+              "content": "u142"
+            },
+            {
+              "role": "assistant",
+              "content": "a143"
+            },
+            {
+              "role": "user",
+              "content": "u144"
+            },
+            {
+              "role": "assistant",
+              "content": "a145"
+            },
+            {
+              "role": "user",
+              "content": "u146"
+            },
+            {
+              "role": "assistant",
+              "content": "a147"
+            },
+            {
+              "role": "user",
+              "content": "u148"
+            },
+            {
+              "role": "assistant",
+              "content": "a149"
+            },
+            {
+              "role": "user",
+              "content": "u150"
+            },
+            {
+              "role": "assistant",
+              "content": "a151"
+            },
+            {
+              "role": "user",
+              "content": "u152"
+            },
+            {
+              "role": "assistant",
+              "content": "a153"
+            },
+            {
+              "role": "user",
+              "content": "u154"
+            },
+            {
+              "role": "assistant",
+              "content": "a155"
+            },
+            {
+              "role": "user",
+              "content": "u156"
+            },
+            {
+              "role": "assistant",
+              "content": "a157"
+            },
+            {
+              "role": "user",
+              "content": "u158"
+            },
+            {
+              "role": "assistant",
+              "content": "a159"
+            },
+            {
+              "role": "user",
+              "content": "u160"
+            },
+            {
+              "role": "assistant",
+              "content": "a161"
+            },
+            {
+              "role": "user",
+              "content": "u162"
+            },
+            {
+              "role": "assistant",
+              "content": "a163"
+            },
+            {
+              "role": "user",
+              "content": "u164"
+            },
+            {
+              "role": "assistant",
+              "content": "a165"
+            },
+            {
+              "role": "user",
+              "content": "u166"
+            },
+            {
+              "role": "assistant",
+              "content": "a167"
+            },
+            {
+              "role": "user",
+              "content": "u168"
+            },
+            {
+              "role": "assistant",
+              "content": "a169"
+            },
+            {
+              "role": "user",
+              "content": "u170"
+            },
+            {
+              "role": "assistant",
+              "content": "a171"
+            },
+            {
+              "role": "user",
+              "content": "u172"
+            },
+            {
+              "role": "assistant",
+              "content": "a173"
+            },
+            {
+              "role": "user",
+              "content": "u174"
+            },
+            {
+              "role": "assistant",
+              "content": "a175"
+            },
+            {
+              "role": "user",
+              "content": "u176"
+            },
+            {
+              "role": "assistant",
+              "content": "a177"
+            },
+            {
+              "role": "user",
+              "content": "u178"
+            },
+            {
+              "role": "assistant",
+              "content": "a179"
+            },
+            {
+              "role": "user",
+              "content": "u180"
+            },
+            {
+              "role": "assistant",
+              "content": "a181"
+            },
+            {
+              "role": "user",
+              "content": "u182"
+            },
+            {
+              "role": "assistant",
+              "content": "a183"
+            },
+            {
+              "role": "user",
+              "content": "u184"
+            },
+            {
+              "role": "assistant",
+              "content": "a185"
+            },
+            {
+              "role": "user",
+              "content": "u186"
+            },
+            {
+              "role": "assistant",
+              "content": "a187"
+            },
+            {
+              "role": "user",
+              "content": "u188"
+            },
+            {
+              "role": "assistant",
+              "content": "a189"
+            },
+            {
+              "role": "user",
+              "content": "u190"
+            },
+            {
+              "role": "assistant",
+              "content": "a191"
+            },
+            {
+              "role": "user",
+              "content": "u192"
+            },
+            {
+              "role": "assistant",
+              "content": "a193"
+            },
+            {
+              "role": "user",
+              "content": "u194"
+            },
+            {
+              "role": "assistant",
+              "content": "a195"
+            },
+            {
+              "role": "user",
+              "content": "u196"
+            },
+            {
+              "role": "assistant",
+              "content": "a197"
+            },
+            {
+              "role": "user",
+              "content": "u198"
+            },
+            {
+              "role": "assistant",
+              "content": "a199"
+            },
+            {
+              "role": "user",
+              "content": "u200"
+            },
+            {
+              "role": "assistant",
+              "content": "a201"
+            },
+            {
+              "role": "user",
+              "content": "u202"
+            },
+            {
+              "role": "assistant",
+              "content": "a203"
+            },
+            {
+              "role": "user",
+              "content": "u204"
+            },
+            {
+              "role": "assistant",
+              "content": "a205"
+            },
+            {
+              "role": "user",
+              "content": "u206"
+            },
+            {
+              "role": "assistant",
+              "content": "a207"
+            },
+            {
+              "role": "user",
+              "content": "u208"
+            },
+            {
+              "role": "assistant",
+              "content": "a209"
+            },
+            {
+              "role": "user",
+              "content": "u210"
+            },
+            {
+              "role": "assistant",
+              "content": "a211"
+            },
+            {
+              "role": "user",
+              "content": "u212"
+            },
+            {
+              "role": "assistant",
+              "content": "a213"
+            },
+            {
+              "role": "user",
+              "content": "u214"
+            },
+            {
+              "role": "assistant",
+              "content": "a215"
+            },
+            {
+              "role": "user",
+              "content": "u216"
+            },
+            {
+              "role": "assistant",
+              "content": "a217"
+            },
+            {
+              "role": "user",
+              "content": "u218"
+            },
+            {
+              "role": "assistant",
+              "content": "a219"
+            },
+            {
+              "role": "user",
+              "content": "继续快照"
+            }
+          ]
+        ]
+      }
+    ]
+  },
+  "s4_plan_injected_system": {
+    "runs": [
+      {
+        "tools": [
+          "AskColleague",
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Task",
+          "TodoWrite",
+          "WaitColleagueReply",
+          "WebFetch",
+          "WebSearch",
+          "Write",
+          "exec_command",
+          "interrupt_agent",
+          "kill_process",
+          "list_agents",
+          "list_processes",
+          "send_message",
+          "wait_agent",
+          "write_stdin"
+        ],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。\n\n## 任务清单（你维护的 plan，跨压缩与重启保留；开始/完成一项时用 TodoWrite 更新，不要向用户复述本清单）\n[>] 修复登录流程（进行中：正在修复登录流程）\n[ ] 写回归测试\n[x] 定位问题"
+            },
+            {
+              "role": "user",
+              "content": "继续"
+            }
+          ]
+        ]
+      }
+    ]
+  },
+  "s5_step_steer_injection": {
+    "runs": [
+      {
+        "tools": [
+          "AskColleague",
+          "Bash",
+          "Edit",
+          "Glob",
+          "Grep",
+          "Read",
+          "Task",
+          "TodoWrite",
+          "WaitColleagueReply",
+          "WebFetch",
+          "WebSearch",
+          "Write",
+          "exec_command",
+          "interrupt_agent",
+          "kill_process",
+          "list_agents",
+          "list_processes",
+          "send_message",
+          "wait_agent",
+          "write_stdin"
+        ],
+        "calls": [
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。"
+            },
+            {
+              "role": "user",
+              "content": "读 hello.txt 再总结"
+            }
+          ],
+          [
+            {
+              "role": "system",
+              "content": "你是运行在「Principal」中的编码代理，工作目录：<DATA>（操作系统：<OS>）。\n\n你可以直接调用工具完成工作，不要只描述你打算做什么：\n- Read：读文件或目录；Write：创建或覆盖文件；Edit：精确替换文件中的一段内容；\n- Glob：按文件名模式找文件；Grep：按内容搜索；Bash：执行命令（测试、构建、git 等）。\n相对路径都基于工作目录解析。先看再改：修改前先用 Read 确认现状，不要猜文件内容。\n改动类（Write/Edit/Bash）与目录外读取会先请求用户批准；被拒绝时改用其他方案或询问用户。\n## 后台命令（长任务 / 交互式命令）\n命令可能很久不结束（dev server、大构建、全量测试）或需要 stdin 交互时，用 exec_command 启动：最多等 yield_ms（默认 10 秒）——结束即返回输出；仍在运行则返回进程号。\n之后用 write_stdin 反复读取新输出或写入输入（process_id 取自返回）；不再需要时用 kill_process 结束。任务结束时所有后台命令会自动终止。快速命令仍直接用 Bash。"
+            },
+            {
+              "role": "user",
+              "content": "读 hello.txt 再总结"
+            },
+            {
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "tool-call",
+                  "toolCallId": "st1",
+                  "toolName": "Read",
+                  "input": {
+                    "file_path": "<DATA>/hello.txt"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": [
+                {
+                  "type": "tool-result",
+                  "toolCallId": "st1",
+                  "toolName": "Read",
+                  "output": {
+                    "type": "text",
+                    "value": "1: hello from snapshot"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "user",
+              "content": "别读了，直接说结论"
+            }
+          ]
+        ]
+      }
+    ]
+  }
+}

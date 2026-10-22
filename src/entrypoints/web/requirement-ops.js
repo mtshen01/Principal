@@ -1,0 +1,1604 @@
+/**
+ * 需求工作流编排 —— docgen / 系统任务串行闸 / 崩溃恢复（bitable 巡检在后续任务追加）。
+ * 串行闸（spec §5.3）：内存队列单泵（仅 principal-web 进程），出队条件 = busy 空 且 conv 无活跃 run；
+ * busy 落盘镜像供崩溃恢复：启动时清残留并记 history，不自动重跑。
+ */
+import fs from 'node:fs';
+import path from 'node:path';
+import { getRequirement, getRequirements, updateRequirement, canTransition } from '../../store/requirements.js';
+import { hasActiveRunForConv, createRun, getRun } from '../../store/runs.js';
+import { getPending } from '../../store/pending-resume.js';
+import { startClaudeRun } from './run-claude.js';
+import { runClaude } from '../../integrations/claude.js';
+import { claudeAuthOpts } from '../../capabilities/token-rotation.js';
+import { runScript } from '../../integrations/shell.js';
+import { appDataPath } from '../../shared/app-paths.js';
+import { logger } from '../../shared/logger.js';
+import { resolveTaskModel, resolveTaskTarget } from '../../shared/model-tasks.js';
+import { sendTextToUser } from '../../integrations/lark.js';
+import { getMyFeishuOpenId, getBots, getActiveBot } from '../../store/settings.js';
+import { currentBranch, ensureBranch, isClean, localBranches } from '../../plugins/team-tools/auto-dev/git.js';
+// 分支名校验复用 routes-git 的那一份（同层纯函数，且已有单测钉住注入类用例）。
+// 在这里另写一条正则就是第二份真相：两处一旦松紧不一，宽的那处就是漏洞
+import { validateBranchName } from './routes-git.js';
+import {
+  pickCwdAndDirs,
+  buildDocgenPrompt,
+  buildRevisePrompt,
+  extractSummary,
+  nextDocVersion,
+  buildDevelopPrompt,
+  buildApiFixPrompt,
+  buildBugFixPrompt,
+  buildSeedPrompt,
+  reqBranchName,
+  buildArchiveSummary,
+  buildAssigneeNotices,
+  buildAssigneeSnapshot,
+  pickPendingNotices,
+  normalizeNotifiedBook,
+  parseFeatureTag,
+  buildFeatureSnapshot,
+} from './req-logic.js';
+import { ROLES, getColleague } from '../../store/colleagues.js';
+import { getUnreadCounts } from '../../store/colleague-messages.js';
+import { listFeatureTags, harvestFiles, getTopFiles } from '../../store/feature-index.js';
+import {
+  parseJsonLoose,
+  normalizeMap,
+  nextMapVersion,
+  buildMapgenPrompt,
+  buildMapFixPrompt,
+  buildMapChangePrompt,
+  buildMapRegenPrompt,
+  buildImpactPrompt,
+  parseImpact,
+  markFreshPoints,
+  upgradeFigmas,
+} from './req-map.logic.js';
+import { buildQuizPrompt, parseQuiz, answersToPromptPart } from './req-quiz.logic.js';
+import { dispatchColleagueDev, abandonColleagueDev, COLLEAGUE_DEV_KIND } from './colleague-dev.js';
+
+export const DOCGEN_TIMEOUT_MS = 15 * 60_000; // spec §5.3：docgen race 上限
+
+// ============================================================
+// docgen 生成状态管理：去超时 + 用户停止 + 实时日志
+// ============================================================
+// （纯内存结构，服务重启时自动清空，无需持久化；生成期异常退出由启动时 busy 恢复逻辑处理）
+
+/** 活跃生成的 AbortController 映射：key=reqId, value=AbortController
+ *  runDocgen 起始时写入，完成/失败/用户停止时删除 */
+export const docgenAborts = new Map();
+
+/** 用户主动停止的集合：标记该 reqId 的生成是由用户触发 abort() 的
+ *  POST /api/req/docgen/stop 时添加，cleanup 时删除 */
+export const userStoppedSet = new Set();
+
+/** 实时日志缓存：key=reqId, value=最后一行文本（≤200 字）
+ *  onText 回调时更新，GET /api/req/get 返回给前端，生成完成后删除 */
+export const docgenLiveLine = new Map();
+
+const POLL_MS = 5000;
+
+/** docgen 前置条件缺失时的引导文案：runDocgen 内部守卫与 routes-requirements.js 的路由层预检共用同一句 */
+export const DOCGEN_GUIDE = '生成开发文档需要至少配置一个工程目录，并先录入需求文档';
+
+/** 需求私有目录/文件路径（惰性建目录）；rest 末段视为文件名，无 rest 时返回目录本身。 */
+export function reqDir(id, ...rest) {
+  const dir = appDataPath('requirements', id, ...rest.slice(0, -1));
+  fs.mkdirSync(dir, { recursive: true });
+  return rest.length ? path.join(dir, rest[rest.length - 1]) : dir;
+}
+
+/** 出队条件（纯函数，测试注入 hasActive）：无 req 或 busy 中 → 拒绝；有 conv 且该 conv 有活跃 run → 拒绝（用户对话中）。 */
+export function canDispatch(req, hasActive = hasActiveRunForConv) {
+  if (!req || req.busy) return false;
+  return !(req.convId && hasActive(req.convId));
+}
+
+/**
+ * 纯函数（测试注入 getRunStatus/hasPendingResume）：判定某需求当前的 busy 是否已「泄漏」——
+ * 对应的 run 已不在跑（不存在或非 running）且没有待续跑登记，说明不是额度阻塞期间的正常等待，
+ * 大概率是 run 经额度耗尽自动续跑链路（doResume 生成的新 run 未重新挂 onSettle）收尾时没能回调到，
+ * busy 从此再也没人清。docgen 的 busy 没有 runId（其失败路径已在进程内自行清理，
+ * 崩溃由 recoverBusyOnBoot 兜底），不参与本判定。
+ * busy.convId（系统任务落在非主会话时才有）优先于需求的 convId —— 它既是前端接流的依据，也是这里判泄漏的依据。
+ */
+export function isBusyStale({ busy, convId }, { getRunStatus, hasPendingResume }) {
+  if (!busy?.runId) return false;
+  if (getRunStatus(busy.runId) === 'running') return false;
+  // 待续跑登记挂在 run 自己的 conv 上。系统任务落在子会话时（colleague-dev）busy.convId 才是那个 conv，
+  // 拿需求的主会话 convId 去查必然查不到，会把正在额度续跑的任务误判成泄漏、清掉 busy 击穿串行闸
+  return !hasPendingResume(busy.convId || convId);
+}
+
+function defaultGetRunStatus(runId) {
+  const run = getRun(runId);
+  return run ? run.status : null;
+}
+
+/** 该 conv 是否存在未终结的待续跑登记（额度阻塞正常等待中） */
+function defaultHasPendingResume(convId) {
+  if (!convId) return false;
+  return getPending().some((e) => e.convId === convId && e.status !== 'done' && e.status !== 'abandoned');
+}
+
+/**
+ * 扫描全部需求，自愈已泄漏的 busy（不影响正常额度阻塞等待中的需求）。导出供测试
+ * （用真实 getRun/getPending 当默认依赖：不存在的 runId 天然判定为「不在跑」，无需 mock）。
+ * bug-fix 泄漏时顺带把该需求 status==='fixing' 的 bug 全部退回 'failed'——run 都没了，
+ * 那条 bug 不可能被继续修，让它继续挂在 'fixing' 会导致前端一直转圈、也没法重试。
+ */
+export function healStaleBusy() {
+  for (const r of getRequirements()) {
+    if (!r.busy?.runId) continue;
+    if (!isBusyStale(r, { getRunStatus: defaultGetRunStatus, hasPendingResume: defaultHasPendingResume })) continue;
+    logger.warn('req-ops', 'stale busy 自愈', { reqId: r.id, kind: r.busy.kind, runId: r.busy.runId });
+    updateRequirement(r.id, { busy: null }, `任务 ${r.busy.kind} 的运行已结束但未回调，自动清理（续跑链泄漏自愈）`);
+    if (r.busy.kind === 'bug-fix' && r.bugs.some((b) => b.status === 'fixing')) {
+      updateRequirement(
+        r.id,
+        { bugs: r.bugs.map((b) => (b.status === 'fixing' ? { ...b, status: 'failed' } : b)) },
+        '续跑链中断，BUG 置失败可重试',
+      );
+    }
+  }
+}
+
+// —— 系统任务队列（develop / api-fix / bug-fix / docgen）：内存队列，仅 web 进程单泵消费 ——
+const queue = []; // [{ reqId, kind, payload }]
+
+/** 去重判别键：区分同一 kind 下指向不同对象的任务（不同 API 文档 / 不同 BUG / 不同变动），避免误合并成一条丢工作项
+ *  msgId：colleague-dev（四期）按同事消息逐条成任务，同 msgId 重复入队才算重复，不同消息绝不能互相顶掉 */
+function taskDiscriminator(payload) {
+  return payload?.bug?.id || payload?.doc?.id || payload?.changeId || payload?.msgId || '';
+}
+
+/**
+ * 合并 docgen 待排队的补充说明：把「即将被移除的旧排队任务已携带的 supplements」与
+ * 「本次新提交的一条 supplement」拼成新数组——用于队列合并同 reqId 连续多条 docgen 时不丢正文
+ * （旧 payload 可能是首次排队的单条 {supplement}，也可能是上一轮已合并过的 {supplements} 多条）。
+ */
+export function combineSupplements(oldPayload, newSupplement) {
+  const prior = oldPayload?.supplements || (oldPayload?.supplement ? [oldPayload.supplement] : []);
+  return newSupplement ? [...prior, newSupplement] : prior;
+}
+
+/**
+ * 系统任务入队：同 reqId+kind（+ 同一 API 文档/BUG）已在队列则 **last-writer-wins**——
+ * 用新 payload 原地替换排队中那条的 payload（队列位置不变），而不是跳过或重复堆积。
+ * 典型场景：用户对同一篇 API 文档连续点了两次「更新」，第二次的 doc 内容才是最新的，
+ * 若简单跳过会让派发时执行的还是第一次点击时的旧文档快照。
+ * docgen 例外：不做「同键替换」，而是合并——同 reqId 连续多条 docgen 只保留最后一条，
+ * 但正文用 combineSupplements 累积进 payload.supplements（用户连续提交多次补充说明时，
+ * 每一条都要喂给 AI，不能因为合并只剩最后一条排队任务就丢了前面几条的正文）。
+ */
+export function enqueueSystemTask(reqId, kind, payload = {}) {
+  if (kind === 'docgen') {
+    let priorPayload = null;
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (queue[i].reqId === reqId && queue[i].kind === 'docgen') {
+        if (!priorPayload) priorPayload = queue[i].payload; // 队列从后往前找，先碰到的是最新排队的那条
+        queue.splice(i, 1);
+      }
+    }
+    const merged = combineSupplements(priorPayload, payload.supplement);
+    payload = merged.length ? { ...payload, supplements: merged } : payload;
+  } else {
+    const idx = queue.findIndex(
+      (t) => t.reqId === reqId && t.kind === kind && taskDiscriminator(t.payload) === taskDiscriminator(payload),
+    );
+    if (idx >= 0) {
+      queue[idx] = { reqId, kind, payload };
+      logger.info('req-ops', '替换排队中的同类任务', { reqId, kind });
+      return;
+    }
+  }
+  queue.push({ reqId, kind, payload });
+  logger.info('req-ops', '系统任务入队', { reqId, kind, queueLen: queue.length });
+}
+
+/** 该需求当前排队中的系统任务只读浅拷贝（供测试与 finalize 定稿前置检查复用；不暴露队列本体，防止被误改） */
+export function queuedTasks(reqId) {
+  return queue.filter((t) => t.reqId === reqId).map((t) => ({ kind: t.kind, payload: t.payload }));
+}
+
+/** 该需求是否还有待派发（尚未出队）的系统任务 */
+export function hasQueuedTasks(reqId) {
+  return queuedTasks(reqId).length > 0;
+}
+
+/**
+ * 纯函数：按谓词规划「从队列里剔除哪些任务」（撤销路径用）。
+ * 单独抽出来是为了不碰模块级队列就能测过滤语义 —— 薄壳只做就地替换。
+ * @param {Array<{reqId:string,kind:string,payload:object}>} list
+ * @param {(t:object)=>boolean} match
+ * @returns {{ kept:Array, removed:number }}
+ */
+export function planQueueRemoval(list, match) {
+  const kept = [];
+  let removed = 0;
+  for (const t of Array.isArray(list) ? list : []) {
+    if (match(t)) removed++;
+    else kept.push(t);
+  }
+  return { kept, removed };
+}
+
+/** 就地把模块级队列替换成 kept（先清后填，保持 queue 的引用不变） */
+function replaceQueue(kept) {
+  queue.length = 0;
+  queue.push(...kept);
+}
+
+/**
+ * 撤离排队中的系统任务（撤销 remove-supplement / revert-req-change 用）。
+ * **只动尚未出队的任务**：已派发（在跑）的一律不动 —— 跑到一半的 docgen/mapchange
+ * 没有安全的取消语义（文档/地图可能已写一半），交给执行侧自然收尾。
+ * @param {string} reqId
+ * @param {string} kind
+ * @param {(payload:object)=>boolean} [match] 默认全匹配
+ * @returns {number} 移除条数
+ */
+export function cancelQueuedTask(reqId, kind, match = () => true) {
+  const { kept, removed } = planQueueRemoval(
+    queue,
+    (t) => t.reqId === reqId && t.kind === kind && match(t.payload || {}),
+  );
+  if (removed) replaceQueue(kept);
+  return removed;
+}
+
+/**
+ * 从排队中的 docgen payload 里摘掉一条补充说明（撤销 remove-supplement 用）。
+ * - 还剩别的补充 → 改写 payload（任务留在队列，位置不变）；
+ * - 摘完一无所有 → 整个任务撤离。
+ * @returns {number} 改动条数（0 = 没有排队中的 docgen 涉及它）
+ */
+export function removeQueuedSupplement(reqId, supplementId) {
+  let changed = 0;
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const t = queue[i];
+    if (t.reqId !== reqId || t.kind !== 'docgen') continue;
+    const list = Array.isArray(t.payload?.supplements)
+      ? t.payload.supplements
+      : t.payload?.supplement
+        ? [t.payload.supplement]
+        : [];
+    if (!list.some((s) => s?.id === supplementId)) continue;
+    changed++;
+    const kept = list.filter((s) => s?.id !== supplementId);
+    if (kept.length) {
+      const payload = { ...t.payload, supplements: kept };
+      delete payload.supplement;
+      queue[i] = { ...t, payload };
+    } else {
+      queue.splice(i, 1);
+    }
+  }
+  return changed;
+}
+
+let pumpStarted = false; // 双泵防呆：一体化入口可能被误调用两次（如根 server.js + sidecar 各起一次）
+
+/** 仅 principal-web 进程调用：启动恢复 + 轮询泵（定时器 unref，避免拖住测试进程退出）。重复调用是安全的空操作。 */
+export function startRequirementPump() {
+  if (pumpStarted) return;
+  pumpStarted = true;
+  recoverBusyOnBoot();
+  const timer = setInterval(pump, POLL_MS);
+  timer.unref();
+}
+
+/**
+ * 崩溃恢复：busy 残留 = 上个进程死在任务中途 → 清标记记档，不自动重跑（用户可从面板重新触发）。
+ *
+ * 例外：该 busy 对应的 conv 上**有待续跑登记**时不清 —— server.js 在本函数之前已跑 recoverPendingAndOrphans，
+ * 把孤儿 run 登记为待续跑，doResume 马上会在那个 conv 上接着改代码。此时清了 busy，canDispatch 只查主会话
+ * 有无活跃 run，落在子会话的 colleague-dev 兜不住，泵会把新任务派发出去与续跑中的 run 并发改同一工作区。
+ * 留着的 busy 由 healStaleBusy 在续跑链结束后按现有口径清掉（isBusyStale 也是按 busy.convId 查登记）。
+ */
+export function recoverBusyOnBoot() {
+  for (const r of getRequirements()) {
+    if (!r.busy) continue;
+    if (defaultHasPendingResume(r.busy.convId || r.convId)) {
+      logger.info('req-ops', 'busy 对应 conv 有待续跑登记，保留等续跑', { reqId: r.id, kind: r.busy.kind, convId: r.busy.convId || r.convId });
+      continue;
+    }
+    updateRequirement(r.id, { busy: null }, `任务 ${r.busy.kind} 因进程重启中断`);
+  }
+}
+
+/**
+ * 每 tick 只出队一个可派发任务；docgen/系统任务的 dispatch 本身启动即返回，不阻塞下一 tick。
+ * 全函数体裹 try/catch：healStaleBusy/getRequirement 走的是同步读盘（Windows 上可能因杀毒/
+ * 索引服务占用而 EBUSY 抛错），这里是 setInterval 回调，异常逃逸会变成 uncaughtException 打死进程。
+ */
+function pump() {
+  try {
+    healStaleBusy(); // 先自愈泄漏的 busy，再决定本 tick 能派发哪个任务
+    if (!queue.length) return;
+    const i = queue.findIndex((t) => canDispatch(getRequirement(t.reqId)));
+    if (i < 0) return;
+    const task = queue.splice(i, 1)[0];
+    try {
+      dispatch(task);
+    } catch (e) {
+      logger.error('req-ops', '系统任务派发异常', { reqId: task.reqId, kind: task.kind, err: e?.message || String(e) });
+    }
+  } catch (e) {
+    logger.error('req-ops', '泵异常（本轮跳过）', { err: e?.message || String(e) });
+  }
+}
+
+/** 导出供测试：验证「需求已离开评审期」时排队中的 docgen 被作废而非误推进版本 */
+export function dispatch({ reqId, kind, payload }) {
+  const req = getRequirement(reqId);
+  if (!req) return;
+  if (kind === 'docgen') {
+    // 双保险第二道：finalize 入口已挡过「队列有待派发任务」，但仍存在极窄窗口——
+    // docgen 在 finalize 检查队列之后、phase 真正落盘之前被派发。此处兜底：一旦需求已不在
+    // 评审期，作废该 docgen，不再推进开发文档版本（避免版本号在开发期继续跳）。
+    if (req.phase !== 'review') {
+      try {
+        updateRequirement(reqId, {}, 'docgen 作废：需求已离开评审期');
+      } catch (e) {
+        logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+      }
+      return;
+    }
+    // fire-and-forget：runDocgen 内部在第一个 await 之前同步写 busy，防止下个 tick 重复出队
+    runDocgen(req, payload).catch((e) =>
+      logger.error('req-ops', 'docgen 任务异常（history 已记录失败原因）', { reqId, err: e?.message || String(e) }),
+    );
+    return;
+  }
+  // 需求 v2 的三类只读任务（问卷 / 地图生成 / 地图修订）：与 docgen 同形态——直连 runClaude、
+  // 不占 conv、只在评审期有意义。mapchange 例外，它由开发期的「需求变动」驱动，见下。
+  if (kind === 'quizgen' || kind === 'mapgen' || kind === 'mapfix') {
+    if (req.phase !== 'review') {
+      try {
+        updateRequirement(reqId, {}, `${kind} 作废：需求已离开评审期`);
+      } catch (e) {
+        logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+      }
+      return;
+    }
+    const runner = { quizgen: runQuizGen, mapgen: runMapGen, mapfix: runMapFix }[kind];
+    runner(req, payload).catch((e) =>
+      logger.error('req-ops', `${kind} 任务异常（history 已记录失败原因）`, { reqId, err: e?.message || String(e) }),
+    );
+    return;
+  }
+  // 需求变动改地图：评审期之后才有意义（评审期直接改需求文档/补充说明即可）
+  if (kind === 'mapchange') {
+    if (req.phase !== 'dev' && req.phase !== 'test') {
+      try {
+        updateRequirement(reqId, {}, 'mapchange 作废：需求已离开开发/测试期');
+      } catch (e) {
+        logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+      }
+      return;
+    }
+    runMapChange(req, payload).catch((e) =>
+      logger.error('req-ops', 'mapchange 任务异常（history 已记录失败原因）', { reqId, err: e?.message || String(e) }),
+    );
+    return;
+  }
+  // 重新生成地图：三个阶段都有意义——评审期用于「地图跑歪了重来」，开发/测试期用于「代码变了重扫」。
+  // phase 白名单与上面任何一组都不同（quizgen/mapgen/mapfix 仅 review，mapchange 仅 dev|test），
+  // 故单列一支；且必须排在下面那道「仅 dev|test」的通用守卫之前，否则评审期的重扫会被静默作废。
+  if (kind === 'mapregen') {
+    if (req.phase !== 'review' && req.phase !== 'dev' && req.phase !== 'test') {
+      try {
+        updateRequirement(reqId, {}, 'mapregen 作废：需求已进入归档阶段');
+      } catch (e) {
+        logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+      }
+      return;
+    }
+    runMapRegen(req).catch((e) =>
+      logger.error('req-ops', 'mapregen 任务异常（history 已记录失败原因）', { reqId, err: e?.message || String(e) }),
+    );
+    return;
+  }
+  // 四期：后端同事消息触发的自动接入。只在开发期有意义（/api/req/apidoc 本身也只在 dev 开放；
+  // 测试期的后端改动该走 BUG 巡检那条路）。执行体在 colleague-dev.js，理由见其文件头。
+  if (kind === COLLEAGUE_DEV_KIND) {
+    if (req.phase !== 'dev') {
+      try {
+        abandonColleagueDev(reqId, payload, '需求已离开开发期');
+      } catch (e) {
+        logger.error('req-ops', 'abandonColleagueDev 失败', { reqId, kind, err: e?.message || String(e) });
+      }
+      return;
+    }
+    dispatchColleagueDev(req, payload);
+    return;
+  }
+  // develop/api-fix 已改为客户端会话驱动（sendMessageProgrammatically），
+  // 不再经服务端系统任务队列。万一因旧版本残留数据入队，直接废弃不派发。
+  if (kind === 'develop' || kind === 'api-fix') {
+    try {
+      updateRequirement(reqId, {}, `系统任务 ${kind} 废弃：已改为客户端会话驱动`);
+    } catch (e) {
+      logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+    }
+    return;
+  }
+  // phase 守卫（bug-fix 仅在开发/测试期执行；其他 phase 包括 undefined 都拒绝）
+  if (req.phase !== 'dev' && req.phase !== 'test') {
+    try {
+      updateRequirement(reqId, {}, `系统任务 ${kind} 作废：需求已离开开发/测试期`);
+    } catch (e) {
+      logger.error('req-ops', 'updateRequirement 失败', { reqId, kind, err: e?.message || String(e) });
+    }
+    return;
+  }
+  dispatchSystemTask(req, kind, payload);
+}
+
+/**
+ * 构造系统任务的 run 收尾回调（导出供测试）。
+ * 归属校验：healStaleBusy 或另一条迟到的 onSettle 都可能先一步清过 busy 并派发了下一个任务——
+ * 例如看门狗/stopRun 先把 run 置终态，settleRun 的回调迟迟才轮到；这期间 healStaleBusy 已判定
+ * 泄漏并清了 busy，队列泵又派发了同需求的下一个任务写入了新 busy。此时这条回调若无脑清 busy，
+ * 会把新任务的 busy 一并清掉，击穿串行闸。因此清 busy 前必须确认「当前 busy.runId 仍是本次收尾
+ * 的这个 run」，不是则说明 busy 早已不是本回调该管的那份，什么都不做。
+ * bug 状态与 devSession 回填不受此校验影响——它们是「这次任务本身跑没跑成功」的记录，
+ * 与「busy 该不该被清」是两件事，照常执行。
+ */
+export function buildSystemTaskOnSettle(req, kind, payload) {
+  return (ok, settledRun) => {
+    const fresh = getRequirement(req.id);
+    if (fresh?.busy?.runId === settledRun?.id) {
+      updateRequirement(req.id, { busy: null }, `系统任务 ${kind} ${ok ? '完成' : '失败'}`);
+    }
+    if (kind === 'bug-fix') setBugStatus(req.id, payload.bug.id, ok ? 'fixed' : 'failed');
+    if (settledRun?.session_id && fresh && !fresh.devSession) {
+      updateRequirement(req.id, { devSession: settledRun.session_id }); // 首次系统任务的 session 回填开发会话锚点
+    }
+  };
+}
+
+/** bug-fix：走 startClaudeRun（conv 流可见），启动即返回，收尾由 onSettle 回调清 busy */
+function dispatchSystemTask(req, kind, payload) {
+  // 防御性校验：仅处理 bug-fix（develop/api-fix 应在 dispatch 中被拦截）
+  if (kind !== 'bug-fix') {
+    updateRequirement(req.id, {}, `系统任务 ${kind} 不支持此派发路径`);
+    return;
+  }
+  const { cwd, addDirs } = pickCwdAndDirs(req.projects);
+  if (!cwd) {
+    // 防御：正常流程（定稿守卫）已保证有开发工程，这里只兜底避免任务卡死在队列里
+    updateRequirement(req.id, {}, `系统任务 ${kind} 作废：无可用工程目录`);
+    return;
+  }
+  // devSession 为空 = 测试期刚换过主会话，没有可续的 Claude session：把需求背景塞进 prompt，
+  // 否则 BUG 会在零上下文的新 session 里修（见 spec §7）。有 session 可续时不传，省 token。
+  // ★ seed 必须与下面 startClaudeRun 的 session 派生自同一次 req 读取，不能塞进入队 payload——
+  //   完整的竞态论证见 req-logic.js 里 buildBugFixPrompt 的 ★ 段，不在此重复。
+  const seed = req.devSession
+    ? ''
+    : buildSeedPrompt(req, { featureSnapshot: buildFeatureSnapshot(req, getTopFiles) });
+  const prompt = buildBugFixPrompt({ ...payload, seed });
+  const run = createRun();
+  updateRequirement(req.id, { busy: { kind, runId: run.id, startedAt: Date.now() } }, `系统任务 ${kind} 启动`);
+  if (kind === 'bug-fix') setBugStatus(req.id, payload.bug.id, 'fixing');
+  run.onSettle = buildSystemTaskOnSettle(req, kind, payload); // run-claude.js 的 settleRun 在 run 真正终结时回调
+  startClaudeRun(run, {
+    prompt,
+    cwd,
+    addDirs,
+    session: req.devSession || undefined,
+    // 无人值守策略（T6）：按 bot.execPolicy 解析（默认 bypass = 与改动前一致）；
+    // standard/trusted 档下策略拒绝会计次熔断并升级 owner
+    execPolicy: getActiveBot()?.execPolicy,
+    unattended: true,
+    convId: req.convId || undefined,
+  });
+}
+
+/** 锁内替换单条 bug 状态（bug-fix 任务生命周期用；后续任务的确认/忽略/重试复用） */
+export function setBugStatus(reqId, bugId, status) {
+  const req = getRequirement(reqId);
+  if (!req) return;
+  updateRequirement(reqId, { bugs: req.bugs.map((b) => (b.id === bugId ? { ...b, status } : b)) });
+}
+
+/**
+ * API 文档副本目录。
+ *
+ * **不能放 `.uploads/` 顶层**：那里被 `routes-files.js#pruneUploads` 按 7 天清理（启动 + 每 24h 一次），
+ * 而 API 文档是需求**全生命周期**的引用对象 —— `buildDevelopPrompt` 每轮开发都把 `d.path` 塞进
+ * prompt 让 Claude 先 Read。开发期一旦超过一周，文档会在无人察觉时从盘上消失，表现成
+ * 「右栏还挂着文档名、Claude 却说文件不存在」。这是 2026-09-22 查同事中继时顺带发现的存量 bug：
+ * web 端手动上传走 `/api/upload` 落顶层，一直中这一条。
+ *
+ * 照 `.uploads/feishu/`（见 `integrations/lark.js`）的先例用子目录 —— `pruneUploads` 只扫顶层文件，
+ * 子目录天然跌出清理范围。
+ */
+const API_DOCS_DIR = appDataPath('.uploads', 'apidocs');
+
+/**
+ * 把来源文件复制进 `API_DOCS_DIR` 自持一份，返回副本路径。
+ *
+ * 为什么必须复制而不是直接登记来源路径 —— 两条链路的来源都不可长期依赖：
+ *   - web 手动上传 → `.uploads/` 顶层，7 天后被 `pruneUploads` 删；
+ *   - 飞书同事发来 → `.uploads/feishu/`，虽不被清理，但那是「收信原件」语义，
+ *     跟需求的文档档案不是一回事（同一份原件可能同时被材料池等别的链路引用）。
+ *
+ * 已在副本目录内则幂等返回，不再复制：否则重试 / 重复登记路径会一路堆副本。
+ */
+function storeApiDocFile(srcPath, name) {
+  try {
+    const inDir = path.resolve(API_DOCS_DIR) + path.sep;
+    if (path.resolve(srcPath).startsWith(inDir)) return { ok: true, path: srcPath };
+    fs.mkdirSync(API_DOCS_DIR, { recursive: true });
+    // 文件名清洗与截尾对齐 lark.js 的 downloadMessageResource：扩展名要留住，Claude 按它判能不能读
+    const safe = String(name).replace(/[^\w.一-龥-]+/g, '_').slice(-60);
+    const dest = path.join(
+      API_DOCS_DIR,
+      Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + '-' + safe,
+    );
+    fs.copyFileSync(srcPath, dest);
+    return { ok: true, path: dest };
+  } catch (e) {
+    return { ok: false, error: 'API 文档存档失败：' + (e?.message || e) };
+  }
+}
+
+/**
+ * 登记 / 更新一份后端 API 文档（同名即更新，保留原 id）。
+ *
+ * 路由 handleApidocPost 与四期「同事发来接口文档」自动处理共用 —— 两处各写一份迟早漂移
+ *（比如一处校验文件存在、一处不校验，或 history 文案不一致）。
+ * 落盘也收在这里：登记前先 `storeApiDocFile` 复制进不被清理的副本目录，**登记的是副本路径**。
+ * 放在这一层而不是各调用方，正是为了让两条链路天然同源（前端因此零改动）。
+ * @param {object|null} req 需求记录；null 映射为 404。phase 与 apiDocs 都现读盘上最新值
+ * @param {{name: string, path: string}} doc name 会 trim（飞书原始文件名不经 str()）
+ * @returns {{ok:true, action:'新增'|'更新', doc:object} | {ok:false, status:400|404|409|500, error:string}}
+ */
+export function registerApiDoc(req, { name: rawName, path: p }) {
+  if (!req) return { ok: false, status: 404, error: '需求不存在' };
+  // phase 与 apiDocs 都现读：调用方是分类完才到这里（秒级延迟），期间需求可能已流转
+  const fresh = getRequirement(req.id) || req;
+  const name = String(rawName ?? '').trim();
+  if (fresh.phase !== 'dev') return { ok: false, status: 409, error: '仅开发期可维护 API 文档' };
+  if (!name || !p) return { ok: false, status: 400, error: 'name/path 均必填' };
+  if (!fs.existsSync(p)) return { ok: false, status: 400, error: '文件不存在：' + p };
+
+  // 存档失败一律 fail-closed：降级登记来源路径等于把「保存成功、7 天后静默消失」写进数据，
+  // 比当场报错糟得多 —— 用户看到报错会重试，看不到的只会在两周后发现 Claude 读不到文件
+  const stored = storeApiDocFile(p, name);
+  if (!stored.ok) {
+    logger.warn('req-ops', 'API 文档存档失败', { reqId: fresh.id, name, src: p, error: stored.error });
+    return { ok: false, status: 500, error: stored.error };
+  }
+
+  // apiDocs 以盘上最新为准而不用调用方快照：自动处理会在一个循环里对多条消息复用同一个 req，
+  // 拿快照整体覆盖会让同一批的第二份文档把第一份静默冲掉（updateRequirement 是浅合并）
+  const apiDocs = fresh.apiDocs || [];
+  const idx = apiDocs.findIndex((d) => d.name === name);
+  const now = new Date().toISOString();
+  let doc, action, next;
+  if (idx >= 0) {
+    doc = { ...apiDocs[idx], path: stored.path, updatedAt: now };
+    next = apiDocs.map((d, i) => (i === idx ? doc : d));
+    action = '更新';
+  } else {
+    doc = { id: 'ad_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), name, path: stored.path, updatedAt: now };
+    next = [...apiDocs, doc];
+    action = '新增';
+  }
+  updateRequirement(fresh.id, { apiDocs: next }, `API 文档${action}：${name}`);
+  return { ok: true, action, doc };
+}
+
+/**
+ * 把多条待合成的补充说明拼成 buildRevisePrompt 需要的单条 {text, files}（导出供测试）：
+ * text 编号拼接「1. …\n2. …」，files 按 path 去重取并集（同一附件在多条补充里重复出现时不重复列出）。
+ */
+export function composeSupplementsForRevise(supplements) {
+  const text = supplements.map((s, i) => `${i + 1}. ${s.text}`).join('\n');
+  const seen = new Set();
+  const files = [];
+  for (const s of supplements) {
+    for (const f of s.files || []) {
+      if (seen.has(f.path)) continue;
+      seen.add(f.path);
+      files.push(f);
+    }
+  }
+  return { text, files };
+}
+
+/**
+ * 两个 promise 赛跑：timeoutPromise 先落定则返回 true（超时），否则返回 false（导出供测试）。
+ * 用 Symbol 哨兵而非「undefined/超时都长得一样」去判断胜负，避免 callPromise 本身也 resolve
+ * 出 undefined 时被误判为超时。抽成纯函数是为了不必等真实 15 分钟：测试注入受控 promise
+ * （如 `new Promise(() => {})` 永不 resolve 模拟仍在跑、`Promise.resolve()` 模拟已到点）即可覆盖两条分支。
+ */
+export async function raceWithTimeoutFlag(callPromise, timeoutPromise) {
+  const TIMED_OUT = Symbol('req-ops-docgen-race-timed-out');
+  const raced = await Promise.race([callPromise, timeoutPromise.then(() => TIMED_OUT)]);
+  return raced === TIMED_OUT;
+}
+
+/**
+ * 评审期开发文档生成/修订。**只应经队列派发**（`enqueueSystemTask(id,'docgen',...)` → 泵 → `dispatch`），
+ * 路由层不得直接调用——busy 占用与串行闸的判定职责在 `canDispatch`/队列这一层，直调会绕过它，
+ * 多次直调可能并发写同一份 dev-doc 版本号。守卫：至少一个工程目录 + 需求文档已录入，否则 throw
+ * （业务错误；调用方——即队列 dispatch 的 fire-and-forget catch——负责落日志，本函数自己也记一条 history）。
+ *
+ * 补充说明来源契约（Task 6 路由接线必读）：首版走 `buildDocgenPrompt` 时读的是**落盘的**
+ * `req.supplements`（store 里的全量历史），修订走 `buildRevisePrompt` 时读的是**入队时传入的**
+ * `payload.supplements`（本轮排队合并的增量）。路由层提交补充说明时必须先
+ * `updateRequirement(id, { supplements: [...] })` 落盘、再 `enqueueSystemTask(id,'docgen',{supplement})`——
+ * 顺序反了的话，若这条补充恰好触发的是「首版」路径（比如 docSession 缺失退化重新生成），
+ * `req.supplements` 里会读不到刚提交的这一条，白白丢正文。
+ */
+export async function runDocgen(req, payload = {}) {
+  const { cwd, addDirs } = pickCwdAndDirs(req?.projects);
+  if (!cwd || !req?.reqDoc) {
+    if (req) updateRequirement(req.id, {}, `开发文档生成被拒：${DOCGEN_GUIDE}`); // 不写 busy，只留痕给前端看见
+    throw new Error(DOCGEN_GUIDE);
+  }
+  // 同步写 busy（在第一个 await 之前）：队列 fire-and-forget 派发后，下个 tick 立刻能看见 busy 已占用
+  updateRequirement(req.id, { busy: { kind: 'docgen', startedAt: Date.now() } }, '开始生成开发文档');
+  // 清除该 reqId 的旧生成状态（防止重复触发时前次 abort 无法被停止）
+  docgenAborts.delete(req.id);
+  userStoppedSet.delete(req.id);
+  docgenLiveLine.delete(req.id);
+  const t0 = Date.now();
+  let capturedTokens = { inputTokens: 0, outputTokens: 0 };
+  try {
+    // 队列合并多条补充说明后 payload.supplements 是数组；单条直传（或历史遗留）时 payload.supplement 是单个对象
+    const supplements = payload.supplements?.length ? payload.supplements : payload.supplement ? [payload.supplement] : [];
+    // 修订但 docSession 缺失（如上一版异常未捕获到 session）时退化为全量重新生成，属自愈路径
+    const canRevise = !!(supplements.length && req.docSession);
+    const existingTags = listFeatureTags();
+    // 功能模型：需求文档可指向自定义模型（openai-compat）。该通道没有 SDK session，
+    // 修订模式（resume 增量）不可用 → 一律走全量重生成（全量 prompt 已含全部补充说明），
+    // 效果是「慢一点但内容正确」，不改变结果契约。
+    const docTarget = resolveTaskTarget('reqDoc');
+    const useOpenAiDoc = docTarget.provider === 'openai-compat';
+    const prompt = canRevise && !useOpenAiDoc
+      ? buildRevisePrompt({
+          supplement: composeSupplementsForRevise(supplements),
+          existingTags,
+          currentTag: req.featureTag ?? null,
+        })
+      : buildDocgenPrompt({
+          reqDocText: fs.readFileSync(req.reqDoc.path, 'utf8'),
+          prime: req.prime ?? null,
+          supplements: req.supplements,
+          projects: req.projects,
+          existingTags,
+          quizPart: answersToPromptPart(req.quiz),
+        });
+    // 关键节点日志：docgen 真正起跑（模式/工程目录/参考目录/prompt 规模）——排查「一直生成中」时
+    // 先看这条是否出现、随后 claude.js 的 ▶runClaude / init / result 三条是否跟上、耗时多少。
+    logger.info('req-ops', 'docgen 开始', {
+      reqId: req.id,
+      mode: canRevise && !useOpenAiDoc ? 'revise' : 'full',
+      cwd,
+      addDirs,
+      supplements: supplements.length,
+      promptChars: prompt.length,
+    });
+
+    let capturedSession = null;
+    let resultText = '';
+    const abort = new AbortController();
+    // 注册到全局 Map，供 POST /api/req/docgen/stop 调用
+    docgenAborts.set(req.id, abort);
+    // 实时最后一行（Claude / 自定义模型两条通道共用）
+    const onChunk = (t) => {
+      resultText += t;
+      // 提取最后一行到 docgenLiveLine：用 lastIndexOf 避免每次 split 全文（O(n²)）
+      const lastNl = resultText.lastIndexOf('\n');
+      const candidate = resultText.slice(lastNl + 1).trim()
+        || resultText.slice(0, lastNl).trimEnd().split('\n').pop()?.trim()
+        || '';
+      if (candidate) docgenLiveLine.set(req.id, candidate.slice(0, 200));
+    };
+    if (useOpenAiDoc) {
+      // openai 通道：readonly 工具面（Read/Grep/Glob），额外参考目录走 readRoots
+      const { runOpenAiAgentTurn } = await import('../../capabilities/llm-openai-agent.js');
+      const r = await runOpenAiAgentTurn({
+        credId: docTarget.credId, model: docTarget.model,
+        prompt, cwd, mode: 'readonly', readRoots: addDirs,
+        signal: abort.signal,
+        onText: onChunk,
+        logTag: 'req/docgen',
+      });
+      if (!resultText && r.result) resultText = r.result;
+      if (r.reason === 'no-credential') throw new Error('功能模型凭证不存在（请到「设置 → 模型」检查）');
+      if (r.reason === 'cancelled' && userStoppedSet.has(req.id)) {
+        const err = new Error('用户已停止');
+        err.name = 'AbortError';
+        throw err;
+      }
+    } else {
+      const docModel = resolveTaskModel('reqDoc');
+      const call = runClaude(prompt, {
+        ...claudeAuthOpts(),
+        ...(docModel ? { model: docModel } : {}),
+        cwd,
+        ...(addDirs.length ? { additionalDirectories: addDirs } : {}),
+        // dontAsk：文档生成只需读代码，未列出的工具直接拒绝。
+        // allowedTools 单用只是免确认，挡不住 Write/Edit/Bash（见 team-tools/review/index.js 注释）。
+        permissionMode: 'dontAsk',
+        allowedTools: ['Read', 'Grep', 'Glob'],
+        ...(canRevise ? { resume: req.docSession } : {}),
+        abortController: abort,
+        onInit: (i) => {
+          capturedSession = i.session_id;
+        },
+        onText: onChunk,
+        onResult: (info) => {
+          if (!resultText && info.result) resultText = info.result;
+          // 捕获 token 数和成本（来自 claude.js 的 onResult 回调）
+          if (info.inputTokens) capturedTokens.inputTokens = info.inputTokens;
+          if (info.outputTokens) capturedTokens.outputTokens = info.outputTokens;
+        },
+      });
+      // 无时间限制，直接等待完成（用户可通过 POST /api/req/docgen/stop 主动中止）
+      await call;
+    }
+
+    if (!resultText || resultText.trim().length < 50) {
+      throw new Error('输出为空或内容过短（可能超时或调用失败），判定生成失败');
+    }
+
+    const elapsed = Date.now() - t0;
+    const v = nextDocVersion(req.devDoc);
+    const docPath = reqDir(req.id, `dev-doc-v${v}.md`);
+    fs.writeFileSync(docPath, resultText, 'utf8');
+    const versions = [
+      ...(req.devDoc?.versions || []),
+      {
+        v,
+        path: docPath,
+        summary: extractSummary(resultText),
+        at: new Date().toISOString(),
+        ms: elapsed,                               // 耗时毫秒
+        inputTokens: capturedTokens.inputTokens,
+        outputTokens: capturedTokens.outputTokens,
+      },
+    ];
+    const featureTag = parseFeatureTag(resultText);
+    const updatePayload = {
+      devDoc: { versions },
+      // openai 通道没有 session 可存：显式清掉旧 session，避免下次修订 resume 到不含最新版的旧会话
+      docSession: useOpenAiDoc ? null : capturedSession || req.docSession,
+      busy: null,
+      ...(featureTag ? { featureTag } : {}), // 仅解析到标签时才写入，不覆盖用户手动设置
+    };
+    const eventMsg = `开发文档 v${v} 生成完成${featureTag ? `（功能模块：${featureTag}）` : ''}`;
+    updateRequirement(req.id, updatePayload, eventMsg);
+    logger.info('req-ops', 'docgen 生成完成', { reqId: req.id, v, ms: elapsed, featureTag: featureTag || '无' });
+    // 双报告（spec §3.4）：文档一落版就续跑地图。resume 同一 docSession，既省 token
+    // 又保证两份报告同源；地图失败不回滚文档（各自独立留痕）。
+    enqueueSystemTask(req.id, 'mapgen', {});
+    // 异步发送通知（不阻塞主流程）
+    sendDocgenNotify(req, elapsed, capturedTokens.inputTokens, capturedTokens.outputTokens).catch((e) =>
+      logger.warn('req-ops', 'docgen 通知异常（已捕获，不影响主流程）', { reqId: req.id, err: e?.message || String(e) }),
+    );
+  } catch (e) {
+    const reason = (e?.message || String(e)).slice(0, 200);
+    const isUserStop = e?.name === 'AbortError' && userStoppedSet.has(req.id);
+    if (isUserStop) {
+      updateRequirement(req.id, { busy: null }, '开发文档生成已停止');
+    } else {
+      updateRequirement(req.id, { busy: null }, `开发文档生成失败：${reason}`);
+    }
+    if (isUserStop) {
+      logger.info('req-ops', 'docgen 用户已停止', { reqId: req.id, ms: Date.now() - t0 });
+    } else {
+      logger.error('req-ops', 'docgen 异常', { reqId: req.id, ms: Date.now() - t0, reason });
+    }
+    throw e;
+  } finally {
+    // 无论成功/失败/用户停止，都清理模块级状态
+    docgenAborts.delete(req.id);
+    userStoppedSet.delete(req.id);
+    docgenLiveLine.delete(req.id);
+  }
+}
+
+/**
+ * docgen 完成后的通知逻辑：异步 fire-and-forget，不阻塞主流程。
+ */
+async function sendDocgenNotify(reqSnapshot, ms, inputTokens, outputTokens) {
+  // 现取最新记录，不能用 docgen 起跑时的 req 快照：评审期首版文档正在生成（可长达 15min）时，
+  // 用户往往这会儿才勾选「机器人通知」并保存 notifyBotId；直接读旧快照会看到 notifyBotId=null
+  // → 静默跳过，正是「勾了却收不到通知」的根因。落库到读取之间用最新盘上值兜住这段时间差。
+  const req = getRequirement(reqSnapshot.id) || reqSnapshot;
+  const myOpenId = getMyFeishuOpenId();
+  if (!myOpenId) {
+    logger.info('req-ops', 'docgen 通知：用户未配置 myFeishuOpenId，跳过', { reqId: req.id });
+    return;
+  }
+  if (!req.notifyBotId) {
+    return; // 不配置则静默不通知
+  }
+  try {
+    const bots = getBots();
+    const bot = bots.find((b) => b.id === req.notifyBotId);
+    if (!bot || !bot.appId || !bot.appSecret) {
+      logger.warn('req-ops', 'docgen 通知：机器人不存在或凭证不完整', { reqId: req.id, botId: req.notifyBotId });
+      return;
+    }
+    // 格式化耗时和 token 数
+    const timeStr = formatDuration(ms);
+    const inputKStr = (inputTokens / 1000).toFixed(1);
+    const outputKStr = (outputTokens / 1000).toFixed(1);
+    const text = `需求「${req.title}」，开发文档已生成\n耗时：${timeStr}\nToken 消耗：输入 ${inputKStr}k · 输出 ${outputKStr}k`;
+
+    // 发送通知（异步 fire-and-forget）
+    sendTextToUser({ appId: bot.appId, appSecret: bot.appSecret }, myOpenId, text).catch((e) =>
+      logger.warn('req-ops', 'docgen 通知发送异常', { reqId: req.id, err: e?.message || String(e) }),
+    );
+  } catch (e) {
+    logger.warn('req-ops', 'docgen 通知准备失败', { reqId: req.id, err: e?.message || String(e) });
+  }
+}
+
+/**
+ * 格式化耗时为人类可读的字符串（毫秒 → "2m 35s"）
+ */
+function formatDuration(ms) {
+  const totalSecs = Math.round(ms / 1000);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  if (mins > 0) return `${mins}m ${secs}s`;
+  return `${secs}s`;
+}
+
+// —— 定稿（评审期 → 开发期）——
+
+const finalizing = new Set(); // 双击护栏：同一需求的 finalize 并发调用时挡住后来者（模块级，仅本进程内存，不落盘）
+
+/** 定稿守卫（纯函数）：评审期 + 无任务进行中 + 有开发文档 + ≥1 开发工程 */
+export function finalizeGuard(req) {
+  if (!req || req.phase !== 'review') return { ok: false, error: '仅评审设计期可定稿' };
+  if (req.busy) return { ok: false, error: '有任务正在进行（如文档生成），请稍候再定稿' };
+  if (!req.devDoc?.versions?.length) return { ok: false, error: '请先生成开发文档' };
+  const devProjects = [req.projects?.frontend, req.projects?.backend].filter((p) => p?.dir && p.dev);
+  if (!devProjects.length) return { ok: false, error: '至少需要一个「开发工程」' };
+  return { ok: true, devProjects };
+}
+
+/**
+ * 决定某开发工程本轮定稿应使用的 baseBranch（纯函数，供 finalizeRequirement 复用/单测）。
+ * 优先复用该工程此前定稿留下的历史记录（重试场景）：一旦重试，工作区当前分支可能已经是
+ * 需求分支本身，此时再读 currentBranch 只会把「需求分支」自己错记成 baseBranch，导致归档阶段
+ * `git log base..branch` 算出空提交、摘要静默丢失。无历史记录时才看 currentBranch；若它恰好
+ * 就是需求分支，说明工作区已就绪，直接以 reqBranch 自身作为 baseBranch（归档摘要为空，可接受）。
+ * @returns {{ baseBranch: string } | { error: 'not-git' }}
+ */
+export function resolveBaseBranch({ prevRecord, currentBranch, reqBranch }) {
+  if (prevRecord) return { baseBranch: prevRecord.baseBranch };
+  if (!currentBranch || currentBranch === 'HEAD') return { error: 'not-git' };
+  if (currentBranch === reqBranch) return { baseBranch: reqBranch }; // 已在目标分支，直接复用
+  return { baseBranch: currentBranch };
+}
+
+/**
+ * 决定某开发工程本轮定稿要落到**哪个分支**（纯函数，与 resolveBaseBranch 配对）。
+ *
+ * 三种模式的由来：定稿原本无条件 `reqBranchName(req)` 自动开新分支，但「这次改动到底
+ * 该独立成支还是接着当前分支做」只有人知道——小修补另开分支等于凭空多一次合并。
+ * 所以改成定稿时由用户在弹框里拍板，本函数只做翻译，不碰 git：
+ *   - `'current'` 沿用当前分支：多工程各自沿用各自的（前端停在 feat-a、后端停在 main
+ *      就分别用这两个），不强求同名——强求同名只会把人挡在定稿之外去手工对齐分支。
+ *   - `'new'` 用用户填的名字。名字已存在时不在这里区分「建」还是「切」：
+ *      `ensureBranch` 对已存在的分支本就是幂等切换，二者在 git 侧是同一个动作。
+ *   - 其余（含缺省）退回自动命名，保住不传参的老调用方。
+ *
+ * @param {object} args
+ * @param {'current'|'new'|''} [args.mode]
+ * @param {string} [args.inputBranch] mode==='new' 时用户填的分支名
+ * @param {string|null} [args.currentBranch] 该工程工作区当前分支
+ * @param {string} args.reqBranch 自动命名兜底（reqBranchName 的产出）
+ * @returns {{ branch: string } | { error: 'not-git' | 'bad-name' }}
+ */
+export function resolveTargetBranch({ mode, inputBranch, currentBranch, reqBranch }) {
+  if (mode === 'current') {
+    // detached HEAD 下 rev-parse --abbrev-ref 回的就是字面量 'HEAD'，那不是个能提交上去的分支
+    if (!currentBranch || currentBranch === 'HEAD') return { error: 'not-git' };
+    return { branch: currentBranch };
+  }
+  if (mode === 'new') {
+    const name = String(inputBranch || '').trim();
+    // 必须服务端再校一次：前端那道只是即时反馈，绕开它就是把用户输入直接拼进 git 命令行
+    if (!validateBranchName(name)) return { error: 'bad-name' };
+    return { branch: name };
+  }
+  return { branch: reqBranch };
+}
+
+/**
+ * 定稿前置信息：每个开发工程的当前分支与本地分支清单 + 自动命名建议。
+ *
+ * 为什么由后端算而不是前端自己从 req.projects 推：「哪些算开发工程」的判据只有
+ * finalizeGuard 一处（`dir && dev`），前端再抄一份就会在判据变化时静默分叉——
+ * 弹框上列出的工程与真正会建分支的工程对不上，是最难发现的一类错。
+ */
+export async function finalizePrecheck(id) {
+  const req = getRequirement(id);
+  const guard = finalizeGuard(req);
+  if (!guard.ok) return { ok: false, status: 409, error: guard.error };
+
+  const projects = [];
+  for (const p of guard.devProjects) {
+    const role = p === req.projects?.backend ? 'backend' : 'frontend';
+    // 读不到不算失败：弹框照样能用（少显示一行当前分支而已），真正的把关在 finalize 里
+    projects.push({
+      dir: p.dir,
+      role,
+      current: (await currentBranch(p.dir)) || '',
+      branches: await localBranches(p.dir),
+    });
+  }
+  return { ok: true, suggested: reqBranchName(req), projects };
+}
+
+/**
+ * 定稿：脏区检查（force 可越）→ 逐开发工程建/切需求分支 → phase=dev → 自动首轮开发入队。
+ * 多工程共用同一 branch 字符串（前后端各自仓库里建同名分支）。
+ *
+ * 双保险第一道：guard 通过后还要查队列（hasQueuedTasks）——guard 只看 `req.busy`（已在跑的任务），
+ * 但队列里可能还躺着一条尚未出队的 docgen（如用户刚提交补充说明，泵还没到下一 tick），此时 busy
+ * 为空、guard 会放行，若不查队列就会带着「即将被派发的 docgen」一起进入开发期。第二道兜底见 dispatch
+ * （极窄窗口：本函数查完队列到 phase 真正落盘之间，docgen 被派发）。
+ *
+ * 双击护栏：finalizing Set 挡住同一 id 的并发重入（用户手抖连点两次「定稿」按钮）。
+ *
+ * 部分进度落盘：每个工程分支就绪后立即把 {dir,branch,baseBranch} 并入 branches 写盘（phase
+ * 暂不推进），这样某个工程中途失败时前面已成功的工程留下历史记录——重试时 resolveBaseBranch
+ * 能从记录里找回真实基线，不必依赖（此时已不可信的）当前工作区分支状态。已建成功的分支本身
+ * 不做回滚（KISS，不做回滚魔法），错误信息里指明哪个目录失败，用户可用 force 重试
+ * （ensureBranch 对已存在的目标分支是幂等切换，重试安全）。
+ */
+/**
+ * 需求的 assignees（同事 id 数组）→ 带姓名/职位的完整条目。
+ *
+ * 收在这里由 routes 的 `/api/req/get` 与定稿通知、归档快照三处共用：join 规则写两份的话，
+ * 「已移除的同事」这类兜底文案迟早在某一处漏掉，表现成界面上有名字、归档里却空白。
+ * 查不到的 id 保留并标 missing，不静默丢——它代表「指派过但同事已被删」。
+ */
+export function resolveAssigneeList(assignees, { reqId = null } = {}) {
+  // 未读数与 assigneeList 一起回，复用开发期右栏既有轮询，不另开接口、不多一次请求
+  const unread = reqId ? getUnreadCounts(reqId) : {};
+  return (Array.isArray(assignees) ? assignees : []).map((cid) => {
+    const c = getColleague(cid);
+    if (!c) {
+      return {
+        id: cid, name: '已移除的同事', role: '', roleLabel: '', feishuOpenId: '',
+        missing: true, unreadCount: unread[cid] || 0,
+      };
+    }
+    return {
+      id: c.id,
+      name: c.name,
+      role: c.role,
+      roleLabel: ROLES.find((x) => x.id === c.role)?.label || '',
+      feishuOpenId: c.feishuOpenId,
+      missing: false,
+      unreadCount: unread[cid] || 0,
+    };
+  });
+}
+
+/**
+ * 定稿成功后给开发人员发私聊（fire-and-forget，不阻塞、不回滚定稿）。
+ *
+ * **必须用当前启用的机器人**，不能用 `req.notifyBotId`：名册里的 open_id 是拿启用机器人的
+ * 凭证从群成员接口取的，而 open_id 是**应用维度**的——换个应用发，同一个人的 id 根本对不上，
+ * 消息会静默丢。（notifyBotId 的语义是「给我自己发完成通知」，与这里给同事发消息不是一回事。）
+ *
+ * 不阻塞定稿：走到这一步分支已经建好、phase 已落 dev，为了几条消息回滚代价过大。
+ * 但结果要回报给调用方在界面上提示——定稿是重要操作，静默失败会让用户以为同事都收到了。
+ *
+ * 重试语义：`alreadyNotified` 是按 open_id 记的已送达账本，本轮只发还没送达的人。
+ * 「部分失败」因此不再是死局 —— 收到的人不会重收，没收到的人下次定稿重试能补上。
+ *
+ * @returns {Promise<{sent:number, sentOpenIds:Record<string,string>, failed:string[], skippedNoId:string[], skippedNoRole:string[], skippedMissing:string[], botMissing:boolean}>}
+ */
+export async function notifyAssigneesOnFinalize(req, devProjects, { alreadyNotified = null } = {}) {
+  const empty = { sent: 0, sentOpenIds: {}, failed: [], skippedNoId: [], skippedNoRole: [], skippedMissing: [], botMissing: false };
+  // 纯后端工程：开发工程里没有前端。机器人自己写后端，「等你的接口文档」这句就不成立
+  const backendOnly = devProjects.length > 0 && devProjects.every((p) => p === req.projects?.backend);
+  const { notices: allNotices, skippedNoId, skippedNoRole, skippedMissing } = buildAssigneeNotices({
+    title: req.title,
+    assigneeList: resolveAssigneeList(req.assignees),
+    backendOnly,
+  });
+  const notices = pickPendingNotices(allNotices, alreadyNotified);
+  const result = { ...empty, skippedNoId, skippedNoRole, skippedMissing };
+  if (!notices.length) return result;
+
+  const bot = getBots().find((b) => b.enabled && b.platform === 'feishu' && b.appId && b.appSecret);
+  if (!bot) {
+    logger.warn('req-ops', '定稿通知：无启用中的飞书机器人，全部跳过', { reqId: req.id, count: notices.length });
+    return { ...result, botMissing: true };
+  }
+  const creds = { appId: bot.appId, appSecret: bot.appSecret };
+  for (const n of notices) {
+    try {
+      const ok = await sendTextToUser(creds, n.openId, n.text);
+      if (ok) {
+        result.sent += 1;
+        result.sentOpenIds[n.openId] = new Date().toISOString();
+      } else result.failed.push(n.name);
+    } catch (e) {
+      result.failed.push(n.name);
+      logger.warn('req-ops', '定稿通知发送异常', { reqId: req.id, name: n.name, err: e?.message || String(e) });
+    }
+  }
+  logger.info('req-ops', '定稿通知已处理', {
+    reqId: req.id,
+    backendOnly,
+    sent: result.sent,
+    failed: result.failed.length,
+    skipped: skippedNoId.length + skippedNoRole.length + skippedMissing.length,
+  });
+  return result;
+}
+
+/**
+ * @param {string} id
+ * @param {object} [opts]
+ * @param {boolean} [opts.force] 跳过脏工作区检查
+ * @param {'current'|'new'|''} [opts.branchMode] 分支策略，见 resolveTargetBranch。
+ *   缺省（老调用方 / 飞书侧）仍走自动命名，行为不变。
+ * @param {string} [opts.branch] branchMode==='new' 时用户填的分支名
+ */
+export async function finalizeRequirement(id, { force = false, branchMode = '', branch: inputBranch = '' } = {}) {
+  if (finalizing.has(id)) return { ok: false, status: 409, error: '定稿正在进行中' };
+  finalizing.add(id);
+  try {
+    const req = getRequirement(id);
+    const guard = finalizeGuard(req);
+    if (!guard.ok) return { ok: false, status: 409, error: guard.error };
+    if (hasQueuedTasks(id)) return { ok: false, status: 409, error: '有任务排队待执行（如文档修订），请稍候再定稿' };
+
+    if (!force) {
+      const dirtyDirs = [];
+      for (const p of guard.devProjects) {
+        if (!(await isClean(p.dir))) dirtyDirs.push(p.dir);
+      }
+      if (dirtyDirs.length) return { ok: false, status: 409, warn: 'dirty', dirs: dirtyDirs };
+    }
+
+    const autoBranch = reqBranchName(req);
+    const branches = [];
+    for (const p of guard.devProjects) {
+      const prevRecord = (req.branches || []).find((b) => b.dir === p.dir);
+      // 有历史记录时本可跳过（见 resolveBaseBranch），但「沿用当前分支」的分支名**就是**
+      // 当前分支，跳过这次读取就没有名字可用了——所以该模式下无论如何都要现读
+      const cur = prevRecord && branchMode !== 'current' ? null : await currentBranch(p.dir);
+
+      const target = resolveTargetBranch({ mode: branchMode, inputBranch, currentBranch: cur, reqBranch: autoBranch });
+      if (target.error) {
+        const msg =
+          target.error === 'not-git'
+            ? `${p.dir} 不是 git 仓库或处于 detached HEAD，无法沿用当前分支`
+            : `分支名不合法：${inputBranch}（只允许字母数字与 / . - _，且不能含 ..）`;
+        return { ok: false, status: 400, error: msg };
+      }
+      const branch = target.branch;
+
+      const resolved = resolveBaseBranch({ prevRecord, currentBranch: cur, reqBranch: branch });
+      // 先统一拦截任意错误码再按码转译：未知码也会在此被拦下走兜底文案，不会静默滑进成功路径
+      if (resolved.error) {
+        const msg =
+          resolved.error === 'not-git'
+            ? `${p.dir} 不是 git 仓库或处于 detached HEAD`
+            : `${p.dir} 无法确定基线分支（${resolved.error}）`;
+        return { ok: false, status: 400, error: msg };
+      }
+      // 沿用当前分支时这里是空操作（ensureBranch 见 cur===branch 直接返回），不会动工作区
+      const r = await ensureBranch(p.dir, branch);
+      if (!r.ok) return { ok: false, status: 500, error: `创建/切换分支失败（${p.dir}，分支 ${branch}）` };
+      branches.push({ dir: p.dir, branch, baseBranch: resolved.baseBranch });
+      updateRequirement(id, { branches: [...branches] }, `定稿进度：${p.dir} 分支就绪`); // 部分进度落盘，供重试自愈
+    }
+
+    // 多工程「沿用当前分支」时各自的分支名可能不同（前端 feat-a、后端 main），
+    // 所以对外的 branch 是去重后的清单而不是单个名字。单工程/新建分支场景下它就是那一个名字
+    const branch = [...new Set(branches.map((b) => b.branch))].join('、');
+    const verb = branchMode === 'current' ? '沿用分支' : '建分支';
+    updateRequirement(id, { phase: 'dev', branches }, `定稿：${verb} ${branch}，进入开发期`);
+    logger.info('req-ops', '需求定稿，进入开发期（develop 由客户端会话驱动）', { reqId: id, branchMode: branchMode || 'auto', branch, dirs: branches.map((b) => b.dir) });
+
+    // 通知开发人员。幂等**按人记**（`assigneeNotified` 是 open_id → 送达时间的账本），
+    // 不是打一个「已通知过」的总标记：定稿失败后可重试（上面每个工程的分支进度都落盘供自愈），
+    // 重试时已送达的人不会再收一条「新需求已收到」——对人的骚扰不像重建分支那样无害；
+    // 而上一轮发失败的人能在重试时补上。用总标记的话，3 人里 1 成 2 败就会把那 2 人
+    // 永久挡在补发之外，且没有任何补救路径（漏通知比重复通知严重得多）。
+    const cur = getRequirement(id) || req;
+    const notified = await notifyAssigneesOnFinalize(cur, guard.devProjects, {
+      alreadyNotified: cur.assigneeNotified,
+    });
+    if (notified.sent > 0) {
+      updateRequirement(
+        id,
+        { assigneeNotified: { ...normalizeNotifiedBook(cur.assigneeNotified), ...notified.sentOpenIds } },
+        `已通知开发人员 ${notified.sent} 人`,
+      );
+    }
+    return { ok: true, branch, notified };
+  } finally {
+    finalizing.delete(id);
+  }
+}
+
+// —— 归档（测试通过 → 归档中 → 已归档）——
+
+/** 默认 git 日志读取实现（单测经 { runGit } 注入桩替换，绕开真实子进程）。 */
+function defaultRunGit(dir, baseBranch, branch) {
+  return runScript('git', ['-C', dir, 'log', `${baseBranch}..${branch}`, '--oneline'], { shell: false });
+}
+
+/** 默认 git diff 实现（单测经 { runGitDiff } 注入桩替换，对齐 runGit 先例）。 */
+function defaultRunGitDiff(dir, baseBranch, branch) {
+  return runScript('git', ['-C', dir, 'diff', `${baseBranch}..${branch}`, '--name-only'], {
+    shell: false,
+  });
+}
+
+const archiving = new Set(); // 双击护栏：同一需求的 archive 并发调用时挡住后来者（对齐 finalizeRequirement 的 finalizing 先例）
+
+/**
+ * 归档：逐分支读取提交概览拼档案 markdown → 写盘 → phase=archived。
+ *
+ * 守卫与路由层 phaseGuard（dev-done/test-pass 用）同准则——canTransition 卡相邻推进，
+ * busy/排队中任务/conv 活跃 run 任一命中即拒。之所以自成一道完整守卫而不依赖路由层，
+ * 是对齐 finalizeRequirement 的做法：本函数就该防得住被绕过路由的直调。
+ *
+ * runGit 可注入（供单测替真实 git 调用）：对每条 req.branches 读 `baseBranch..branch` 的
+ * `--oneline` 概览。调用失败 → log=null（buildArchiveSummary 契约：null/falsy 渲染成
+ * 「无法读取提交摘要」）；调用成功但输出为空（该分支相对基线确实无新提交，如只读工程
+ * 全程未被自动开发碰过）→ 必须落一个非空占位字符串，不能落 null，否则会被
+ * buildArchiveSummary 误判成「读取失败」。
+ *
+ * branchLogs 每条同时带 dir：多工程定稿时共用同一 branch 字符串（前后端各自仓库里建同名
+ * 分支），buildArchiveSummary 按 dir（而非 branch）索引，避免双工程档案互相覆盖。
+ */
+export async function archiveRequirement(id, note, { runGit = defaultRunGit, runGitDiff = defaultRunGitDiff } = {}) {
+  if (archiving.has(id)) return { ok: false, status: 409, error: '归档正在进行中' };
+  archiving.add(id);
+  try {
+    const req = getRequirement(id);
+    if (!req) return { ok: false, status: 404, error: '需求不存在' };
+    const t = canTransition(req.phase, 'archived');
+    if (!t.ok) return { ok: false, status: 409, error: t.error };
+    if (req.busy || hasQueuedTasks(id) || hasActiveRunForConv(req.convId)) {
+      return { ok: false, status: 409, error: '有任务进行中/排队，请先等待完成或停止' };
+    }
+
+    const branchLogs = [];
+    for (const b of req.branches || []) {
+      const r = await runGit(b.dir, b.baseBranch, b.branch);
+      const out = (r?.out || '').trim();
+      branchLogs.push({ dir: b.dir, log: !r?.ok ? null : out || '（该分支相对基线无新提交）' });
+    }
+
+    // 收割改动文件至功能账本（有 featureTag 才执行；失败降级静默跳过，不阻塞归档）
+    if (req.featureTag) {
+      try {
+        const allFiles = [];
+        for (const b of req.branches || []) {
+          const r = await runGitDiff(b.dir, b.baseBranch, b.branch);
+          if (r?.ok && r.out?.trim()) {
+            allFiles.push(...r.out.trim().split('\n').filter(Boolean));
+          }
+        }
+        if (allFiles.length) {
+          harvestFiles(req.featureTag, allFiles);
+          logger.info('req-ops', '功能账本收割完成', {
+            reqId: id,
+            tag: req.featureTag,
+            fileCount: allFiles.length,
+          });
+        }
+      } catch (e) {
+        logger.warn('req-ops', '功能账本收割异常（已跳过，不影响归档）', {
+          reqId: id,
+          err: e?.message || String(e),
+        });
+      }
+    }
+
+    // fail-closed：note 非字符串（如前端传了对象）一律归空串，不落 [object Object]（同 handleGuidelines 的处理方式）
+    const cleanNote = (typeof note === 'string' ? note : '').slice(0, 2000);
+    // 开发人员快照：归档是审计语义，固化「当时是谁」。名册后续改名/转职/删号都不该
+    // 反向改写已归档的历史（开发期的 assignees 存 id 是为了跟着名册同步，两者刻意相反）
+    const archiveAssignees = buildAssigneeSnapshot(resolveAssigneeList(req.assignees));
+    const summary = buildArchiveSummary({ req: { ...req, archiveAssignees }, note: cleanNote, branchLogs });
+    fs.writeFileSync(reqDir(id, 'archive.md'), summary, 'utf8');
+    updateRequirement(
+      id,
+      {
+        phase: 'archived',
+        archive: { note: cleanNote, summary, archivedAt: new Date().toISOString(), assignees: archiveAssignees },
+      },
+      '确认归档',
+    );
+    logger.info('req-ops', '需求归档完成', { reqId: id, branches: branchLogs.length, assignees: archiveAssignees.length });
+    return { ok: true };
+  } finally {
+    archiving.delete(id);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 需求 v2：问卷 / 需求地图 / 需求变动（spec docs/superpowers/specs/2026-08-25-req-v2-design.md）
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** 影响预估是用户在弹框里等的同步调用，不能用 docgen 那 15 分钟的上限 */
+export const IMPACT_TIMEOUT_MS = 90_000;
+
+/**
+ * 全量重扫比 docgen 更重，15 分钟的 DOCGEN_TIMEOUT_MS 偏紧，取 30 分钟。
+ * 不像 runDocgen 那样干脆无超时：那条路径有配套的 /api/req/docgen/stop 可中止，
+ * runReadonlyClaude 没有——无超时 + 无停止手段 = 卡住了只能重启进程。
+ */
+export const MAPREGEN_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * 评审期只读 Claude 调用的公共外壳（quizgen / mapgen / mapfix / mapchange 共用）。
+ *
+ * 与 runDocgen 的 race+abort 骨架同源。**没有顺手把 runDocgen 也改成调它**：那条路径承载了
+ * 补充说明合并、版本落盘、功能标签、飞书通知等一堆分支，注释里还记着多次事故的成因，
+ * 为了 DRY 去动它风险明显大于收益。新任务共用本函数即可，后续要合并再一起做。
+ *
+ * busy 在**第一个 await 之前**同步写入（防下个 tick 重复出队）；成功由调用方清、失败在这里清。
+ */
+async function runReadonlyClaude(req, kind, { prompt, resume = null, startEvent, timeoutMs = DOCGEN_TIMEOUT_MS }) {
+  const { cwd, addDirs } = pickCwdAndDirs(req?.projects);
+  if (!cwd) throw new Error('未配置任何工程目录');
+  updateRequirement(req.id, { busy: { kind, startedAt: Date.now() } }, startEvent);
+  // 功能模型任务映射：问卷 → 需求文档生成；地图系列（mapgen/mapfix/mapchange/mapregen）→ 需求地图
+  const taskId = kind === 'quizgen' ? 'reqDoc' : 'reqMap';
+
+  const t0 = Date.now();
+  try {
+    let capturedSession = null;
+    let text = '';
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    let raceTimer;
+    try {
+      const target = resolveTaskTarget(taskId);
+      if (target.provider === 'openai-compat') {
+        // 自定义模型通道：resume 不可用（调用点传的都是 null/增量语境），readonly 工具面
+        const { runOpenAiAgentTurn } = await import('../../capabilities/llm-openai-agent.js');
+        const r = await runOpenAiAgentTurn({
+          credId: target.credId, model: target.model,
+          prompt, cwd, mode: 'readonly', readRoots: addDirs,
+          timeoutMs, signal: abort.signal,
+          onText: (t) => {
+            text += t;
+          },
+          logTag: 'req/' + kind,
+        });
+        if (!text && r.result) text = r.result;
+        if (r.reason === 'no-credential') throw new Error('功能模型凭证不存在（请到「设置 → 模型」检查）');
+        if (r.reason === 'timeout') throw new Error('生成超时（流未结束）');
+      } else {
+        const model = resolveTaskModel(taskId);
+        const call = runClaude(prompt, {
+          ...claudeAuthOpts(),
+          ...(model ? { model } : {}),
+          cwd,
+          ...(addDirs.length ? { additionalDirectories: addDirs } : {}),
+          // dontAsk + allowedTools 双保险：只读任务不该有任何写能力（见 runDocgen 同款注释）
+          permissionMode: 'dontAsk',
+          allowedTools: ['Read', 'Grep', 'Glob'],
+          ...(resume ? { resume } : {}),
+          abortController: abort,
+          onInit: (i) => {
+            capturedSession = i.session_id;
+          },
+          onText: (t) => {
+            text += t;
+          },
+          onResult: (info) => {
+            if (!text && info.result) text = info.result;
+          },
+        });
+        call.catch((e) =>
+          logger.warn('req-ops', kind + ' 调用异常（已落兜底）', { reqId: req.id, err: e?.message || String(e) }),
+        );
+        const timeoutPromise = new Promise((resolve) => {
+          raceTimer = setTimeout(resolve, timeoutMs + 2_000);
+        });
+        if (await raceWithTimeoutFlag(call, timeoutPromise)) throw new Error('生成超时（流未结束）');
+      }
+    } finally {
+      clearTimeout(timer);
+      clearTimeout(raceTimer);
+    }
+    if (!text || text.trim().length < 20) throw new Error('输出为空或过短，判定生成失败');
+    logger.info('req-ops', kind + ' 调用完成', { reqId: req.id, ms: Date.now() - t0, chars: text.length });
+    return { text, sessionId: capturedSession };
+  } catch (e) {
+    const reason = (e?.message || String(e)).slice(0, 200);
+    updateRequirement(req.id, { busy: null }, kind + ' 失败：' + reason);
+    logger.error('req-ops', kind + ' 失败', { reqId: req.id, ms: Date.now() - t0, reason });
+    throw e;
+  }
+}
+
+/** 某需求某版地图 JSON；v 省略取最新。无地图/读失败返回 null（调用方据此走降级）。 */
+export function readMapVersion(req, v = null) {
+  const versions = req?.reqMap?.versions || [];
+  if (!versions.length) return null;
+  const target = v == null ? versions[versions.length - 1] : versions.find((x) => x.v === Number(v));
+  if (!target) return null;
+  try {
+    const map = JSON.parse(fs.readFileSync(target.path, 'utf8'));
+    // 旧版地图（page.figma 单对象 + 页面级 restoredAt）在唯一的读出口统一升级为 figmas 数组，
+    // 下游（前端 / 路由就地改 / 重生成取 prev）一律只认新结构。
+    // 不回写落盘：upgradeFigmas 是确定性的，每次读都升级出同一份 id，没有回写的必要。
+    for (const p of map?.pages || []) {
+      p.figmas = upgradeFigmas(p);
+      delete p.figma;
+      delete p.restoredAt;
+    }
+    return map;
+  } catch (e) {
+    logger.warn('req-ops', '地图读取失败', { reqId: req.id, v: target.v, err: e?.message || String(e) });
+    return null;
+  }
+}
+
+/** 就地覆盖写当前版地图（挂设计稿 / 存标注这类不产生新版本的改动走这里）。 */
+export function writeMapVersion(req, map, v = null) {
+  const versions = req?.reqMap?.versions || [];
+  const target = v == null ? versions[versions.length - 1] : versions.find((x) => x.v === Number(v));
+  if (!target) throw new Error('该版本地图不存在');
+  fs.writeFileSync(target.path, JSON.stringify(map, null, 2), 'utf8');
+  return target.v;
+}
+
+/** 地图落盘 + 版本登记（四条产地图的链路共用，保证 markFreshPoints / 回迁设计稿不会漏做）。 */
+function persistMap(req, rawText, { prev, event }) {
+  const map = normalizeMap(parseJsonLoose(rawText), { prev });
+  if (!map.pages.length) throw new Error('地图为空（模型未产出任何页面）');
+  markFreshPoints(prev, map);
+  const v = nextMapVersion(req.reqMap);
+  const p = reqDir(req.id, 'map-v' + v + '.json');
+  fs.writeFileSync(p, JSON.stringify({ v, ...map }, null, 2), 'utf8');
+  const versions = [...(req.reqMap?.versions || []), { v, path: p, at: new Date().toISOString() }];
+  updateRequirement(
+    req.id,
+    { reqMap: { versions }, busy: null },
+    event + '（v' + v + '，' + map.pages.length + ' 个页面）',
+  );
+  logger.info('req-ops', '地图落版', { reqId: req.id, v, pages: map.pages.length });
+  return { v, map };
+}
+
+/**
+ * 问卷生成。失败**不阻塞主流程**（spec §3.3）：路由层收到失败会引导用户直接走 docgen，
+ * 所以这里只把状态写回、留痕，不做任何补偿动作。
+ */
+export async function runQuizGen(req) {
+  const { cwd } = pickCwdAndDirs(req?.projects);
+  if (!cwd || !req?.reqDoc) {
+    updateRequirement(req.id, {}, '问卷生成被拒：' + DOCGEN_GUIDE);
+    throw new Error(DOCGEN_GUIDE);
+  }
+  const { text, sessionId } = await runReadonlyClaude(req, 'quizgen', {
+    prompt: buildQuizPrompt({
+      reqDocText: fs.readFileSync(req.reqDoc.path, 'utf8'),
+      projects: req.projects,
+      // 背景也要喂给出题环节：界面上承诺了「你说清楚的地方就不会再问」，
+      // 只喂 docgen 不喂这里，用户写了半页背景还被问同样的问题
+      primeText: req.prime?.text || '',
+    }),
+    startEvent: '开始生成不确定点问卷',
+  });
+  let questions;
+  try {
+    questions = parseQuiz(text);
+  } catch (e) {
+    // 解析失败与「没找出歧义」是同一种结局：这次不出问卷，直接让用户去生成开发文档
+    updateRequirement(req.id, { busy: null, quiz: null }, '问卷未生成：' + (e?.message || String(e)).slice(0, 120));
+    throw e;
+  }
+  updateRequirement(
+    req.id,
+    {
+      quiz: { status: 'ready', questions, answers: {}, at: new Date().toISOString() },
+      docSession: sessionId || req.docSession,
+      busy: null,
+    },
+    '问卷已生成（' + questions.length + ' 题）',
+  );
+  return questions;
+}
+
+/** 地图首次生成：紧跟在 docgen 之后，resume 同一 docSession。 */
+export async function runMapGen(req) {
+  const docPath = req.devDoc?.versions?.at(-1)?.path || '';
+  if (!docPath) throw new Error('尚无开发文档，无法生成需求地图');
+  // docSession 丢了就没上下文可续，降级为「现读开发文档」——比直接失败强
+  const resume = req.docSession || null;
+  const { text } = await runReadonlyClaude(req, 'mapgen', {
+    prompt: buildMapgenPrompt(resume ? {} : { docPath }),
+    resume,
+    startEvent: '开始生成需求地图',
+  });
+  try {
+    return persistMap(req, text, { prev: readMapVersion(req), event: '需求地图生成完成' });
+  } catch (e) {
+    updateRequirement(req.id, { busy: null }, '需求地图生成失败：' + (e?.message || String(e)).slice(0, 160));
+    throw e;
+  }
+}
+
+/** 标注 → 一轮修订，出 v+1。标注随旧版留在旧文件里，新版天然是空的。 */
+export async function runMapFix(req) {
+  const prev = readMapVersion(req);
+  if (!prev) throw new Error('尚无需求地图可修订');
+  // 无有效标注会在这里抛，不白跑一次 LLM，也不会凭空多出一个版本
+  const prompt = buildMapFixPrompt({ map: prev, annots: prev.annots || {} });
+  const { text } = await runReadonlyClaude(req, 'mapfix', {
+    prompt,
+    resume: req.docSession || null,
+    startEvent: '开始按标注修订需求地图',
+  });
+  try {
+    return persistMap(req, text, { prev, event: '需求地图按标注修订完成' });
+  } catch (e) {
+    updateRequirement(req.id, { busy: null }, '需求地图修订失败：' + (e?.message || String(e)).slice(0, 160));
+    throw e;
+  }
+}
+
+/** 开发期「需求变动」→ 更新地图，出 v+1。 */
+export async function runMapChange(req, payload = {}) {
+  const prev = readMapVersion(req);
+  if (!prev) throw new Error('尚无需求地图可更新');
+  const { text } = await runReadonlyClaude(req, 'mapchange', {
+    prompt: buildMapChangePrompt({ map: prev, text: payload.text }),
+    resume: req.docSession || null,
+    startEvent: '开始按需求变动更新地图',
+  });
+  try {
+    return persistMap(req, text, { prev, event: '需求地图按变动更新完成' });
+  } catch (e) {
+    updateRequirement(req.id, { busy: null }, '需求地图更新失败：' + (e?.message || String(e)).slice(0, 160));
+    throw e;
+  }
+}
+
+/**
+ * 本需求分支相对基线的改动文件清单 —— 重扫地图的范围锚点。
+ * 复用归档链路的 defaultRunGitDiff，可注入供单测替真实 git 调用。
+ *
+ * 任何一个工程失败都只跳过它自己：清单是锦上添花，绝不能因为某个目录不是 git 仓库
+ * 就把整次重扫拦下来。评审期 branches 为空，天然返回 []（那时也确实还没开始写代码）。
+ */
+export async function collectChangedFiles(req, { runGitDiff = defaultRunGitDiff } = {}) {
+  const files = [];
+  for (const b of req?.branches || []) {
+    try {
+      const r = await runGitDiff(b.dir, b.baseBranch, b.branch);
+      if (r?.ok && r.out?.trim()) {
+        files.push(...r.out.trim().split('\n').map((x) => x.trim()).filter(Boolean));
+      }
+    } catch (e) {
+      logger.warn('req-ops', '改动文件清单读取失败（跳过该工程）', {
+        reqId: req?.id,
+        dir: b.dir,
+        err: e?.message || String(e),
+      });
+    }
+  }
+  return files;
+}
+
+/**
+ * 重新生成地图：以当前代码为准全量重扫，出 v+1。
+ *
+ * 四条产地图链路里**唯一不 resume docSession** 的。其余三条都续跑评审期那个 session
+ * 省 token，但那份上下文正是「开发前的代码理解」，带着它重扫等于让模型确认自己的旧结论，
+ * 看不见代码已经变了。代价是要重新读一遍代码，这是「重扫」的固有成本，不是可优化项。
+ *
+ * prev 允许为 null：地图从没生成成功过（如 docgen 后的 mapgen 挂了）时，这里是唯一的重试路径。
+ */
+export async function runMapRegen(req) {
+  const docPath = req.devDoc?.versions?.at(-1)?.path || '';
+  if (!docPath) throw new Error('尚无开发文档，无法重新生成需求地图');
+  const prev = readMapVersion(req);
+  const changedFiles = await collectChangedFiles(req);
+  logger.info('req-ops', 'mapregen 起跑', {
+    reqId: req.id,
+    phase: req.phase,
+    changedFiles: changedFiles.length,
+    prevPages: (prev?.pages || []).length,
+  });
+  const { text } = await runReadonlyClaude(req, 'mapregen', {
+    prompt: buildMapRegenPrompt({
+      docPath,
+      prevPageNames: (prev?.pages || []).map((p) => p.name),
+      changes: (req.changes || []).map((c) => c.text),
+      changedFiles,
+    }),
+    resume: null,
+    startEvent: '开始重新生成需求地图（以当前代码为准）',
+    timeoutMs: MAPREGEN_TIMEOUT_MS,
+  });
+  try {
+    return persistMap(req, text, { prev, event: '需求地图重新生成完成' });
+  } catch (e) {
+    updateRequirement(req.id, { busy: null }, '需求地图重新生成失败：' + (e?.message || String(e)).slice(0, 160));
+    throw e;
+  }
+}
+
+/**
+ * 需求变动影响预估：**同步**返回（用户在弹框里等），故不占 busy、不进队列、不给任何工具。
+ * 地图缺失或推理失败一律降级为空数组——预估只是锦上添花，不能挡住用户提交变动。
+ */
+export async function computeChangeImpact(req, text) {
+  const map = readMapVersion(req);
+  if (!map) return [];
+  let prompt;
+  try {
+    prompt = buildImpactPrompt({ map, text });
+  } catch {
+    return []; // 正文为空 / 地图没有逻辑点：没什么可预估的
+  }
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), IMPACT_TIMEOUT_MS);
+  try {
+    let out = '';
+    // 功能模型：影响预估可指向自定义模型（openai-compat）——纯推理零工具，走单轮通道
+    const target = resolveTaskTarget('reqMap');
+    if (target.provider === 'openai-compat') {
+      const { runOpenAiOnce } = await import('../../capabilities/llm-openai-agent.js');
+      const r = await runOpenAiOnce({
+        credId: target.credId, model: target.model,
+        prompt,
+        timeoutMs: IMPACT_TIMEOUT_MS,
+        signal: abort.signal,
+        logTag: 'req/impact',
+      });
+      out = r.text || '';
+    } else {
+      const model = resolveTaskModel('reqMap');
+      const call = runClaude(prompt, {
+        ...claudeAuthOpts(),
+        ...(model ? { model } : {}),
+        cwd: pickCwdAndDirs(req.projects).cwd || undefined,
+        permissionMode: 'dontAsk',
+        allowedTools: [], // 纯推理：给了工具它就会跑去读代码，把 90 秒耗光
+        abortController: abort,
+        onText: (t) => {
+          out += t;
+        },
+        onResult: (info) => {
+          if (!out && info.result) out = info.result;
+        },
+      });
+      call.catch(() => {}); // race 放弃后仍可能 reject，预挂 catch 防 unhandled
+      const timeoutPromise = new Promise((resolve) => setTimeout(resolve, IMPACT_TIMEOUT_MS + 2_000));
+      if (await raceWithTimeoutFlag(call, timeoutPromise)) return [];
+    }
+    return parseImpact(out, map);
+  } catch (e) {
+    logger.warn('req-ops', '影响预估失败（降级为空）', { reqId: req.id, err: e?.message || String(e) });
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
